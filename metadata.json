@@ -1,0 +1,6 @@
+{
+  "name": "EdgeClaw",
+  "description": "100% offline on-device AI file and media agent powered by LiteRT-LM Gemma models, Room FTS search, and ML Kit OCR.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
