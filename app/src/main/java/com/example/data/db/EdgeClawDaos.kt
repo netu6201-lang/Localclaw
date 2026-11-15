@@ -1,10 +1,36 @@
 package com.example.data.db
 
+import androidx.compose.runtime.Immutable
+import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
+
+@Immutable
+data class FileSearchListItem(
+    @ColumnInfo(name = "id")
+    val id: Long,
+    @ColumnInfo(name = "file_path")
+    val filePath: String,
+    @ColumnInfo(name = "file_name")
+    val fileName: String,
+    @ColumnInfo(name = "parent_dir")
+    val parentDir: String,
+    @ColumnInfo(name = "mime_type")
+    val mimeType: String,
+    @ColumnInfo(name = "file_category")
+    val fileCategory: String,
+    @ColumnInfo(name = "size_bytes")
+    val sizeBytes: Long,
+    @ColumnInfo(name = "last_modified_ms")
+    val lastModifiedMs: Long,
+    @ColumnInfo(name = "snippet_preview")
+    val snippetPreview: String,
+    @ColumnInfo(name = "has_embedding")
+    val hasEmbedding: Boolean
+)
 
 @Dao
 interface FileIndexDao {
@@ -26,8 +52,127 @@ interface FileIndexDao {
     @Query("SELECT COUNT(*) FROM file_index WHERE is_trashed = 0")
     fun observeIndexedCount(): Flow<Int>
 
+    @Query("SELECT COUNT(*) FROM file_index WHERE is_trashed = 0 AND embedding_vector IS NOT NULL")
+    fun observeEmbeddedCount(): Flow<Int>
+
+    @Query("SELECT * FROM file_index WHERE id = :id LIMIT 1")
+    suspend fun getById(id: Long): FileIndexEntity?
+
     @Query("SELECT * FROM file_index WHERE file_path = :path LIMIT 1")
     suspend fun getByPath(path: String): FileIndexEntity?
+
+    @Query(
+        """
+        SELECT f.id, f.file_path, f.file_name, f.parent_dir, f.mime_type, f.file_category,
+               f.size_bytes, f.last_modified_ms,
+               SUBSTR(f.extracted_text, 1, 220) AS snippet_preview,
+               (f.embedding_vector IS NOT NULL) AS has_embedding
+        FROM file_index AS f
+        JOIN file_index_fts AS fts ON f.id = fts.rowid
+        WHERE file_index_fts MATCH :ftsQuery
+          AND f.is_trashed = 0
+          AND (:category IS NULL OR f.file_category = :category)
+          AND (:minModifiedMs IS NULL OR f.last_modified_ms >= :minModifiedMs)
+        ORDER BY f.last_modified_ms DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun searchFtsPaged(
+        ftsQuery: String,
+        category: String? = null,
+        minModifiedMs: Long? = null,
+        limit: Int = 60,
+        offset: Int = 0
+    ): List<FileSearchListItem>
+
+    @Query(
+        """
+        SELECT COUNT(*)
+        FROM file_index AS f
+        JOIN file_index_fts AS fts ON f.id = fts.rowid
+        WHERE file_index_fts MATCH :ftsQuery
+          AND f.is_trashed = 0
+          AND (:category IS NULL OR f.file_category = :category)
+          AND (:minModifiedMs IS NULL OR f.last_modified_ms >= :minModifiedMs)
+        """
+    )
+    suspend fun countFtsMatches(
+        ftsQuery: String,
+        category: String? = null,
+        minModifiedMs: Long? = null
+    ): Int
+
+    @Query(
+        """
+        SELECT id, file_path, file_name, parent_dir, mime_type, file_category,
+               size_bytes, last_modified_ms,
+               SUBSTR(extracted_text, 1, 220) AS snippet_preview,
+               (embedding_vector IS NOT NULL) AS has_embedding
+        FROM file_index
+        WHERE is_trashed = 0
+          AND (:category IS NULL OR file_category = :category)
+          AND (:minModifiedMs IS NULL OR last_modified_ms >= :minModifiedMs)
+          AND (:likeTerm = '' OR file_name LIKE '%' || :likeTerm || '%' OR extracted_text LIKE '%' || :likeTerm || '%' OR file_path LIKE '%' || :likeTerm || '%')
+        ORDER BY last_modified_ms DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun searchFallbackLikePaged(
+        likeTerm: String,
+        category: String? = null,
+        minModifiedMs: Long? = null,
+        limit: Int = 60,
+        offset: Int = 0
+    ): List<FileSearchListItem>
+
+    @Query(
+        """
+        SELECT COUNT(*)
+        FROM file_index
+        WHERE is_trashed = 0
+          AND (:category IS NULL OR file_category = :category)
+          AND (:minModifiedMs IS NULL OR last_modified_ms >= :minModifiedMs)
+          AND (:likeTerm = '' OR file_name LIKE '%' || :likeTerm || '%' OR extracted_text LIKE '%' || :likeTerm || '%' OR file_path LIKE '%' || :likeTerm || '%')
+        """
+    )
+    suspend fun countFallbackLikeMatches(
+        likeTerm: String,
+        category: String? = null,
+        minModifiedMs: Long? = null
+    ): Int
+
+    @Query(
+        """
+        SELECT * FROM file_index
+        WHERE is_trashed = 0
+          AND embedding_vector IS NOT NULL
+          AND (:category IS NULL OR file_category = :category)
+          AND (:minModifiedMs IS NULL OR last_modified_ms >= :minModifiedMs)
+          AND (:maxModifiedMs IS NULL OR last_modified_ms <= :maxModifiedMs)
+        ORDER BY last_modified_ms DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getFilesWithEmbeddings(
+        category: String? = null,
+        minModifiedMs: Long? = null,
+        maxModifiedMs: Long? = null,
+        limit: Int = 500
+    ): List<FileIndexEntity>
+
+    @Query(
+        """
+        SELECT * FROM file_index
+        WHERE is_trashed = 0
+          AND (embedding_vector IS NULL OR embedding_model_id != :modelId)
+        ORDER BY last_modified_ms DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getFilesNeedingEmbeddings(modelId: String, limit: Int = 300): List<FileIndexEntity>
+
+    @Query("UPDATE file_index SET embedding_vector = :vector, embedding_model_id = :modelId WHERE id = :fileId")
+    suspend fun updateFileEmbedding(fileId: Long, vector: ByteArray, modelId: String)
 
     @Query(
         """

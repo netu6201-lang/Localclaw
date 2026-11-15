@@ -1,14 +1,20 @@
 package com.example.ai.agent
 
 import com.example.ai.engine.EngineRuntimeStatus
+import com.example.ai.engine.HybridSearchEngine
 import com.example.ai.engine.LocalLlmEngineManager
 import com.example.data.db.AgentMemoryDao
 import com.example.data.db.AgentMemoryEntity
 import com.example.data.db.FileIndexDao
 import com.example.data.db.FileIndexEntity
 import com.example.data.db.FtsQuerySanitizer
+import com.example.operations.OperationControlManager
+import com.example.operations.OperationType
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -16,21 +22,23 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import java.io.File
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
  * Core ReAct Agentic Loop (Plan -> Tool Call -> Execute -> Observe -> Respond)
- * bound strictly to local Room FTS4, ML Kit OCR/PDF extracted text, and sandboxed Kotlin file operations.
+ * bound strictly to local Room FTS4, EmbeddingGemma vector search, ML Kit OCR/PDF text,
+ * and sandboxed Kotlin file operations.
  */
 class FileAgentOrchestrator(
     private val llmEngineManager: LocalLlmEngineManager,
+    private val hybridSearchEngine: HybridSearchEngine,
     private val fileIndexDao: FileIndexDao,
     private val agentMemoryDao: AgentMemoryDao,
     private val fileOpsExecutor: FileOperationsExecutor,
-    private val guardrails: SandboxGuardrails
+    private val guardrails: SandboxGuardrails,
+    private val operationControlManager: OperationControlManager
 ) {
 
     private val json = Json {
@@ -49,11 +57,42 @@ class FileAgentOrchestrator(
     val isAgentBusy: StateFlow<Boolean> = _isAgentBusy.asStateFlow()
 
     private var confirmationDeferred: CompletableDeferred<Boolean>? = null
+    private var activeAgentJob: Job? = null
+    private var activeAssistantMsgId: String? = null
 
     fun resolvePendingConfirmation(approved: Boolean) {
         confirmationDeferred?.complete(approved)
         confirmationDeferred = null
         _pendingConfirmation.value = null
+    }
+
+    fun pauseAgent() {
+        operationControlManager.pause(OperationType.AGENT_TASK, "Agent paused by user")
+    }
+
+    fun resumeAgent() {
+        operationControlManager.resume(OperationType.AGENT_TASK, "Resuming agent step...")
+    }
+
+    fun stopAgent() {
+        operationControlManager.stop(OperationType.AGENT_TASK, "Stopped by user")
+        confirmationDeferred?.complete(false)
+        confirmationDeferred = null
+        _pendingConfirmation.value = null
+        activeAgentJob?.cancel()
+        activeAssistantMsgId?.let { id ->
+            _messages.update { list ->
+                list.map { msg ->
+                    if (msg.id == id && msg.isStreaming) {
+                        msg.copy(
+                            text = if (msg.text == "Thinking on-device...") "Agent stopped by user." else "${msg.text}\n\n[Stopped by user]",
+                            isStreaming = false
+                        )
+                    } else msg
+                }
+            }
+        }
+        _isAgentBusy.value = false
     }
 
     fun clearConversation() {
@@ -63,6 +102,7 @@ class FileAgentOrchestrator(
     suspend fun submitUserPrompt(userText: String) = withContext(Dispatchers.IO) {
         if (userText.isBlank() || _isAgentBusy.value) return@withContext
         _isAgentBusy.value = true
+        activeAgentJob = currentCoroutineContext()[Job]
 
         val userMsg = AgentChatMessage(
             id = UUID.randomUUID().toString(),
@@ -70,7 +110,15 @@ class FileAgentOrchestrator(
             text = userText.trim()
         )
         val assistantMsgId = UUID.randomUUID().toString()
+        activeAssistantMsgId = assistantMsgId
         val traces = mutableListOf<AgentStepTrace>()
+
+        val maxSteps = 5
+        operationControlManager.start(
+            type = OperationType.AGENT_TASK,
+            total = maxSteps,
+            detail = "Analyzing request..."
+        )
 
         _messages.update {
             it + userMsg + AgentChatMessage(
@@ -83,18 +131,19 @@ class FileAgentOrchestrator(
         }
 
         try {
+            operationControlManager.checkpoint(OperationType.AGENT_TASK)
             val engineReady = llmEngineManager.telemetry.value.status == EngineRuntimeStatus.READY
             if (!engineReady) {
-                // Deterministic local FTS fallback assist when no .litertlm/.task weight file is loaded yet,
-                // while making clear how to load a model for full autonomous Gemma tool-calling.
                 val fallbackTrace = AgentStepTrace(
                     stage = TraceStage.PLAN,
-                    title = "Engine Standby -> Direct FTS4 Assist",
-                    detail = "No .litertlm/.task model loaded yet. Executing direct offline FTS4 + Memory lookup."
+                    title = "Engine Standby -> Direct Hybrid/FTS4 Assist",
+                    detail = "No .litertlm/.task LLM loaded yet. Executing direct offline Hybrid + FTS4 + Memory lookup."
                 )
                 traces += fallbackTrace
+                operationControlManager.checkpoint(OperationType.AGENT_TASK)
                 val localAnswer = runDirectOfflineAssist(userText.trim(), traces)
                 updateAssistantMessage(assistantMsgId, localAnswer, traces, isStreaming = false)
+                operationControlManager.complete(OperationType.AGENT_TASK, "Completed offline lookup")
                 return@withContext
             }
 
@@ -108,11 +157,19 @@ class FileAgentOrchestrator(
             var currentTurnPrompt = "User request: $userText"
             var finalResponse = ""
             var lastBatchId: String? = null
-            val maxSteps = 5
 
             for (step in 1..maxSteps) {
+                operationControlManager.checkpoint(OperationType.AGENT_TASK)
+                operationControlManager.updateProgress(
+                    OperationType.AGENT_TASK,
+                    step,
+                    maxSteps,
+                    "Step $step / $maxSteps: Generating plan..."
+                )
+
                 val streamBuffer = StringBuilder()
                 llmEngineManager.generateStreaming(currentTurnPrompt).collect { chunk ->
+                    operationControlManager.checkpoint(OperationType.AGENT_TASK)
                     streamBuffer.append(chunk)
                     val displayPreview = stripToolMarkupForPreview(streamBuffer.toString())
                     updateAssistantMessage(
@@ -151,6 +208,13 @@ class FileAgentOrchestrator(
                 )
                 updateAssistantMessage(assistantMsgId, "Executing ${parsedTool.tool}...", traces, isStreaming = true)
 
+                operationControlManager.checkpoint(OperationType.AGENT_TASK)
+                operationControlManager.updateProgress(
+                    OperationType.AGENT_TASK,
+                    step,
+                    maxSteps,
+                    "Executing tool: ${parsedTool.tool}"
+                )
                 val observation = executeToolWithGuardrails(parsedTool, traces) { batchId ->
                     lastBatchId = batchId
                 }
@@ -180,6 +244,20 @@ class FileAgentOrchestrator(
                 batchId = lastBatchId,
                 isStreaming = false
             )
+            operationControlManager.complete(OperationType.AGENT_TASK, "Agent task complete")
+        } catch (_: CancellationException) {
+            traces += AgentStepTrace(
+                stage = TraceStage.ERROR,
+                title = "Agent Stopped",
+                detail = "Operation stopped by user."
+            )
+            updateAssistantMessage(
+                id = assistantMsgId,
+                text = "Agent stopped by user.",
+                traces = traces,
+                isStreaming = false
+            )
+            operationControlManager.stop(OperationType.AGENT_TASK, "Stopped by user")
         } catch (t: Throwable) {
             traces += AgentStepTrace(
                 stage = TraceStage.ERROR,
@@ -192,7 +270,10 @@ class FileAgentOrchestrator(
                 traces = traces,
                 isStreaming = false
             )
+            operationControlManager.fail(OperationType.AGENT_TASK, t.message ?: "Agent error")
         } finally {
+            activeAgentJob = null
+            activeAssistantMsgId = null
             _pendingConfirmation.value = null
             _isAgentBusy.value = false
         }
@@ -203,32 +284,44 @@ class FileAgentOrchestrator(
         traces: MutableList<AgentStepTrace>
     ): String {
         val ftsQuery = FtsQuerySanitizer.toSafeFtsQuery(userText)
-        val matches = if (ftsQuery.isNotEmpty()) {
-            fileIndexDao.searchFts(ftsQuery, limit = 8)
-        } else {
-            emptyList()
-        }
+        val hits = hybridSearchEngine.search(
+            rawQuery = userText,
+            limit = 8
+        )
+        val usedSemantic = hits.any { it.semanticSimilarity > 0f }
         val memories = agentMemoryDao.queryByKeyword(userText.take(24), limit = 5)
 
         traces += AgentStepTrace(
             stage = TraceStage.TOOL_CALL,
             title = "Tool: search_files",
-            detail = "{\"query\": \"$ftsQuery\", \"file_type\": \"ALL\"}"
+            detail = "{\"query\": \"${ftsQuery.ifBlank { userText }}\", \"mode\": \"${if (usedSemantic) "HYBRID_VECTOR_FTS4" else "FTS4"}\"}"
         )
         traces += AgentStepTrace(
             stage = TraceStage.OBSERVE,
             title = "Observation (search_files)",
-            detail = "Found ${matches.size} FTS4 match(es), ${memories.size} memory rule(s)."
+            detail = "Found ${hits.size} ${if (usedSemantic) "Hybrid (FTS4 + EmbeddingGemma)" else "FTS4"} match(es), ${memories.size} memory rule(s)."
         )
 
         return buildString {
-            append("Offline FTS4 Index Result (Load a Gemma .litertlm/.task model in the Models tab for full autonomous reasoning & multi-step file organization):\n\n")
-            if (matches.isEmpty()) {
-                append("No indexed files matched \"$userText\". Try tapping 'Scan & OCR Storage' in the Explorer tab.")
+            val header = if (usedSemantic) {
+                "Offline Hybrid Search (EmbeddingGemma + FTS4)"
             } else {
-                append("Matched ${matches.size} file(s):\n")
-                matches.forEachIndexed { index, file ->
-                    append("${index + 1}. ${file.fileName} (${file.fileCategory}, ${file.sizeBytes / 1024} KB)\n")
+                "Offline FTS4 Index Result"
+            }
+            append("$header (Load an Agent LLM in the Models tab for full autonomous reasoning & multi-step file organization):\n\n")
+            if (hits.isEmpty()) {
+                append("No indexed files matched \"$userText\". Try tapping 'Scan & OCR' in the Explorer tab.")
+            } else {
+                append("Matched ${hits.size} file(s):\n")
+                hits.forEachIndexed { index, hit ->
+                    val file = hit.file
+                    val simLabel = if (hit.semanticSimilarity > 0f) {
+                        val pct = (hit.semanticSimilarity * 100f).toInt().coerceIn(0, 100)
+                        " • semantic ${pct}%"
+                    } else {
+                        ""
+                    }
+                    append("${index + 1}. ${file.fileName} (${file.fileCategory}, ${file.sizeBytes / 1024} KB$simLabel)\n")
                     append("   Path: ${file.filePath}\n")
                     if (file.extractedText.isNotBlank()) {
                         append("   Snippet: ${file.extractedText.take(110).replace("\n", " ")}...\n")
@@ -257,23 +350,43 @@ class FileAgentOrchestrator(
                     "LAST_30_DAYS" -> System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
                     else -> null
                 }
-                val fts = FtsQuerySanitizer.toSafeFtsQuery(args.query)
-                val results: List<FileIndexEntity> = when {
-                    fts.isNotEmpty() -> {
-                        fileIndexDao.searchFts(fts, category = category, minModifiedMs = minMs, limit = 20)
-                            .ifEmpty {
-                                fileIndexDao.searchFallbackLike(args.query, category = category, minModifiedMs = minMs, limit = 20)
+                if (args.query.isNotBlank()) {
+                    val hits = hybridSearchEngine.search(
+                        rawQuery = args.query,
+                        category = category,
+                        minModifiedMs = minMs,
+                        limit = 20
+                    )
+                    if (hits.isEmpty()) {
+                        "No matching files found in SQLite FTS4 or EmbeddingGemma vector index."
+                    } else {
+                        hits.joinToString("\n") { hit ->
+                            val f = hit.file
+                            val preview = f.extractedText.take(120).replace("\n", " ")
+                            val simTag = if (hit.semanticSimilarity > 0f) {
+                                String.format(Locale.US, " | sim=%.2f", hit.semanticSimilarity)
+                            } else {
+                                ""
                             }
+                            "- ${f.fileName} | category=${f.fileCategory} | size=${f.sizeBytes}B$simTag | path=${f.filePath}" +
+                                if (preview.isNotBlank()) " | text=\"$preview\"" else ""
+                        }
                     }
-                    else -> fileIndexDao.searchFallbackLike("", category = category, minModifiedMs = minMs, limit = 20)
-                }
-                if (results.isEmpty()) {
-                    "No matching files found in SQLite FTS index."
                 } else {
-                    results.joinToString("\n") { f ->
-                        val preview = f.extractedText.take(120).replace("\n", " ")
-                        "- ${f.fileName} | category=${f.fileCategory} | size=${f.sizeBytes}B | path=${f.filePath}" +
-                            if (preview.isNotBlank()) " | text=\"$preview\"" else ""
+                    val results: List<FileIndexEntity> = fileIndexDao.searchFallbackLike(
+                        likeTerm = "",
+                        category = category,
+                        minModifiedMs = minMs,
+                        limit = 20
+                    )
+                    if (results.isEmpty()) {
+                        "No matching files found in SQLite FTS index."
+                    } else {
+                        results.joinToString("\n") { f ->
+                            val preview = f.extractedText.take(120).replace("\n", " ")
+                            "- ${f.fileName} | category=${f.fileCategory} | size=${f.sizeBytes}B | path=${f.filePath}" +
+                                if (preview.isNotBlank()) " | text=\"$preview\"" else ""
+                        }
                     }
                 }
             }

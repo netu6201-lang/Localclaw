@@ -17,9 +17,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderCopy
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.FolderCopy
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -51,14 +53,20 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.operations.OperationProgress
+import com.example.operations.OperationType
 import com.example.ui.screens.AgentScreen
 import com.example.ui.screens.ExplorerScreen
 import com.example.ui.screens.ModelGalleryScreen
+import com.example.ui.screens.SearchScreen
 import com.example.ui.state.EdgeClawViewModel
 import kotlinx.serialization.Serializable
 
 @Serializable
 data object ExplorerRoute
+
+@Serializable
+data object SearchRoute
 
 @Serializable
 data object AgentRoute
@@ -77,10 +85,17 @@ private data class TopDestination(
 private val DESTINATIONS = listOf(
     TopDestination(
         route = ExplorerRoute,
-        label = "Explorer",
+        label = "Vault",
         selectedIcon = Icons.Filled.FolderCopy,
         unselectedIcon = Icons.Outlined.FolderCopy,
         testTag = "nav_explorer"
+    ),
+    TopDestination(
+        route = SearchRoute,
+        label = "Search",
+        selectedIcon = Icons.Filled.Search,
+        unselectedIcon = Icons.Outlined.Search,
+        testTag = "nav_search"
     ),
     TopDestination(
         route = AgentRoute,
@@ -106,14 +121,21 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
 
     val explorerFiles by viewModel.explorerFiles.collectAsStateWithLifecycle()
     val indexedCount by viewModel.indexedCount.collectAsStateWithLifecycle()
+    val embeddedCount by viewModel.embeddedCount.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val selectedCategory by viewModel.selectedCategory.collectAsStateWithLifecycle()
     val hasAllFilesAccess by viewModel.hasAllFilesAccess.collectAsStateWithLifecycle()
     val isIndexing by viewModel.isIndexing.collectAsStateWithLifecycle()
     val indexStatusMessage by viewModel.indexStatusMessage.collectAsStateWithLifecycle()
 
+    val searchScreenState by viewModel.searchScreenState.collectAsStateWithLifecycle()
+    val operationStates by viewModel.operationStates.collectAsStateWithLifecycle()
+
     val models by viewModel.models.collectAsStateWithLifecycle()
     val telemetry by viewModel.telemetry.collectAsStateWithLifecycle()
+    val embeddingTelemetry by viewModel.embeddingTelemetry.collectAsStateWithLifecycle()
+    val isVectorizing by viewModel.isVectorizing.collectAsStateWithLifecycle()
+    val vectorizeStatusMessage by viewModel.vectorizeStatusMessage.collectAsStateWithLifecycle()
     val engineSettings by viewModel.engineSettings.collectAsStateWithLifecycle()
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle()
 
@@ -246,15 +268,49 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
                             ExplorerScreen(
                                 files = explorerFiles,
                                 indexedCount = indexedCount,
+                                embeddedCount = embeddedCount,
+                                embeddingTelemetry = embeddingTelemetry,
                                 searchQuery = searchQuery,
                                 selectedCategory = selectedCategory,
                                 hasAllFilesAccess = hasAllFilesAccess,
                                 isIndexing = isIndexing,
                                 indexStatusMessage = indexStatusMessage,
+                                autoScanNewMedia = engineSettings.autoScanNewMedia,
+                                operationStates = operationStates,
                                 onSearchQueryChange = viewModel::updateSearchQuery,
                                 onSelectCategory = viewModel::selectCategory,
                                 onStartIndexing = viewModel::startStorageIndexing,
+                                onScanSelectedMedia = viewModel::scanSelectedMedia,
+                                onToggleAutoScanNewMedia = viewModel::setAutoScanNewMedia,
+                                onPauseOperation = viewModel::pauseOperation,
+                                onResumeOperation = viewModel::resumeOperation,
+                                onStopOperation = viewModel::stopOperation,
                                 onRequestMediaPermissions = ::requestMediaAndNotificationPermissions,
+                                onAskAgentAboutFile = { file ->
+                                    draftAgentPrompt = "Summarize and organize '${file.fileName}' (${file.filePath})"
+                                    navigateTopLevel(AgentRoute)
+                                },
+                                onSafeTrashFile = viewModel::safeTrashSingleFile
+                            )
+                        }
+
+                        composable<SearchRoute> {
+                            SearchScreen(
+                                state = searchScreenState,
+                                indexedCount = indexedCount,
+                                embeddingTelemetry = embeddingTelemetry,
+                                operationStates = operationStates,
+                                onQueryChange = viewModel::updateSearchScreenQuery,
+                                onSelectCategory = viewModel::selectSearchScreenCategory,
+                                onSelectDateRange = viewModel::selectSearchScreenDateRange,
+                                onToggleHybrid = viewModel::toggleSearchScreenHybrid,
+                                onTriggerSearchNow = viewModel::triggerSearchNow,
+                                onStopSearch = viewModel::stopActiveSearch,
+                                onLoadMore = viewModel::loadMoreSearchResults,
+                                onPauseOperation = viewModel::pauseOperation,
+                                onResumeOperation = viewModel::resumeOperation,
+                                onStopOperation = viewModel::stopOperation,
+                                onLoadFullFile = viewModel::loadFullFileForInspector,
                                 onAskAgentAboutFile = { file ->
                                     draftAgentPrompt = "Summarize and organize '${file.fileName}' (${file.filePath})"
                                     navigateTopLevel(AgentRoute)
@@ -268,12 +324,17 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
                                 messages = agentMessages,
                                 pendingConfirmation = pendingConfirmation,
                                 isAgentBusy = isAgentBusy,
+                                agentOperation = operationStates[OperationType.AGENT_TASK]
+                                    ?: OperationProgress(type = OperationType.AGENT_TASK),
                                 telemetry = telemetry,
                                 actionLogs = actionLogs,
                                 memoryRules = memoryRules,
                                 initialDraftPrompt = draftAgentPrompt,
                                 onConsumeDraftPrompt = { draftAgentPrompt = "" },
                                 onSendPrompt = viewModel::sendAgentPrompt,
+                                onPauseAgent = { viewModel.pauseOperation(OperationType.AGENT_TASK) },
+                                onResumeAgent = { viewModel.resumeOperation(OperationType.AGENT_TASK) },
+                                onStopAgent = { viewModel.stopOperation(OperationType.AGENT_TASK) },
                                 onApproveBatch = viewModel::approvePendingAction,
                                 onUndoBatch = viewModel::undoBatch,
                                 onUpsertMemory = viewModel::upsertMemoryRule,
@@ -287,13 +348,27 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
                             ModelGalleryScreen(
                                 models = models,
                                 telemetry = telemetry,
+                                embeddingTelemetry = embeddingTelemetry,
+                                indexedCount = indexedCount,
+                                embeddedCount = embeddedCount,
+                                isVectorizing = isVectorizing,
+                                vectorizeStatusMessage = vectorizeStatusMessage,
+                                operationStates = operationStates,
                                 selectedDelegate = engineSettings.delegate,
                                 downloadProgress = downloadProgress,
                                 onSelectDelegate = viewModel::selectHardwareDelegate,
                                 onDownloadModel = viewModel::downloadModel,
+                                onPauseDownload = viewModel::pauseModelDownload,
+                                onResumeDownload = viewModel::resumeModelDownload,
                                 onCancelDownload = viewModel::cancelDownload,
                                 onLoadModel = viewModel::loadModel,
                                 onUnloadModel = viewModel::unloadModel,
+                                onLoadEmbeddingModel = viewModel::loadEmbeddingModel,
+                                onUnloadEmbeddingModel = viewModel::unloadEmbeddingModel,
+                                onBuildVectors = viewModel::buildMissingEmbeddings,
+                                onPauseOperation = viewModel::pauseOperation,
+                                onResumeOperation = viewModel::resumeOperation,
+                                onStopOperation = viewModel::stopOperation,
                                 onDeleteModel = viewModel::deleteModelFile,
                                 onImportLocalUri = viewModel::importLocalModel
                             )

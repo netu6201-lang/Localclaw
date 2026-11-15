@@ -13,7 +13,7 @@ import androidx.room.RoomDatabase
         ActionLogEntity::class,
         ModelRecordEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class EdgeClawDatabase : RoomDatabase() {

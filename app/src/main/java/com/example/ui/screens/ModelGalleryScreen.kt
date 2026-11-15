@@ -22,10 +22,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Speed
@@ -57,23 +59,42 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.ai.engine.EmbeddingRuntimeStatus
+import com.example.ai.engine.EmbeddingTelemetry
 import com.example.ai.engine.EngineRuntimeStatus
 import com.example.ai.engine.LlmTelemetry
 import com.example.data.db.ModelRecordEntity
 import com.example.data.preferences.HardwareDelegate
+import com.example.operations.OperationProgress
+import com.example.operations.OperationType
+import com.example.ui.components.OperationControlBar
 import java.util.Locale
 
 @Composable
 fun ModelGalleryScreen(
     models: List<ModelRecordEntity>,
     telemetry: LlmTelemetry,
+    embeddingTelemetry: EmbeddingTelemetry,
+    indexedCount: Int,
+    embeddedCount: Int,
+    isVectorizing: Boolean,
+    vectorizeStatusMessage: String,
+    operationStates: Map<OperationType, OperationProgress>,
     selectedDelegate: HardwareDelegate,
     downloadProgress: Map<String, Int>,
     onSelectDelegate: (HardwareDelegate) -> Unit,
     onDownloadModel: (ModelRecordEntity) -> Unit,
+    onPauseDownload: (ModelRecordEntity) -> Unit,
+    onResumeDownload: (ModelRecordEntity) -> Unit,
     onCancelDownload: (String) -> Unit,
     onLoadModel: (ModelRecordEntity) -> Unit,
     onUnloadModel: () -> Unit,
+    onLoadEmbeddingModel: (ModelRecordEntity) -> Unit,
+    onUnloadEmbeddingModel: () -> Unit,
+    onBuildVectors: () -> Unit,
+    onPauseOperation: (OperationType) -> Unit,
+    onResumeOperation: (OperationType) -> Unit,
+    onStopOperation: (OperationType) -> Unit,
     onDeleteModel: (ModelRecordEntity) -> Unit,
     onImportLocalUri: (Uri) -> Unit,
     modifier: Modifier = Modifier
@@ -151,11 +172,29 @@ fun ModelGalleryScreen(
             }
         }
 
-        // Real-Time Telemetry Card
+        // Real-Time LLM Telemetry Card
         item {
             TelemetryStripCard(
                 telemetry = telemetry,
                 onUnloadModel = onUnloadModel
+            )
+        }
+
+        // EmbeddingGemma Vector Search Telemetry Card
+        item {
+            EmbeddingTelemetryCard(
+                embeddingTelemetry = embeddingTelemetry,
+                indexedCount = indexedCount,
+                embeddedCount = embeddedCount,
+                isVectorizing = isVectorizing,
+                vectorizeStatusMessage = vectorizeStatusMessage,
+                vectorizeOperation = operationStates[OperationType.VECTORIZE]
+                    ?: OperationProgress(type = OperationType.VECTORIZE),
+                onBuildVectors = onBuildVectors,
+                onUnloadEmbeddingModel = onUnloadEmbeddingModel,
+                onPauseVectorize = { onPauseOperation(OperationType.VECTORIZE) },
+                onResumeVectorize = { onResumeOperation(OperationType.VECTORIZE) },
+                onStopVectorize = { onStopOperation(OperationType.VECTORIZE) }
             )
         }
 
@@ -240,19 +279,202 @@ fun ModelGalleryScreen(
             }
         }
 
-        // Model Cards
-        items(models, key = { it.modelId }) { model ->
+        val embeddingModels = models.filter { it.modelRole == "EMBEDDING" }
+        val llmModels = models.filter { it.modelRole != "EMBEDDING" }
+
+        if (embeddingModels.isNotEmpty()) {
+            item {
+                Text(
+                    text = "Embedding Models (Instant Hybrid Search)",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+            items(embeddingModels, key = { it.modelId }) { model ->
+                ModelEntryCard(
+                    model = model,
+                    isLoaded = embeddingTelemetry.loadedModelId == model.modelId &&
+                        (embeddingTelemetry.status == EmbeddingRuntimeStatus.READY ||
+                            embeddingTelemetry.status == EmbeddingRuntimeStatus.EMBEDDING),
+                    isLoading = embeddingTelemetry.loadedModelId == model.modelId &&
+                        embeddingTelemetry.status == EmbeddingRuntimeStatus.LOADING,
+                    progressPct = downloadProgress[model.modelId] ?: 0,
+                    onDownload = { onDownloadModel(model) },
+                    onPauseDownload = { onPauseDownload(model) },
+                    onResumeDownload = { onResumeDownload(model) },
+                    onCancel = { onCancelDownload(model.modelId) },
+                    onLoad = { onLoadEmbeddingModel(model) },
+                    onUnload = onUnloadEmbeddingModel,
+                    onDelete = { onDeleteModel(model) }
+                )
+            }
+        }
+
+        item {
+            Text(
+                text = "Agent LLMs (Offline ReAct Brain)",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+
+        // LLM Model Cards
+        items(llmModels, key = { it.modelId }) { model ->
             ModelEntryCard(
                 model = model,
                 isLoaded = telemetry.loadedModelId == model.modelId && telemetry.status == EngineRuntimeStatus.READY,
                 isLoading = telemetry.loadedModelId == model.modelId && telemetry.status == EngineRuntimeStatus.LOADING,
                 progressPct = downloadProgress[model.modelId] ?: 0,
                 onDownload = { onDownloadModel(model) },
+                onPauseDownload = { onPauseDownload(model) },
+                onResumeDownload = { onResumeDownload(model) },
                 onCancel = { onCancelDownload(model.modelId) },
                 onLoad = { onLoadModel(model) },
                 onUnload = onUnloadModel,
                 onDelete = { onDeleteModel(model) }
             )
+        }
+    }
+}
+
+@Composable
+private fun EmbeddingTelemetryCard(
+    embeddingTelemetry: EmbeddingTelemetry,
+    indexedCount: Int,
+    embeddedCount: Int,
+    isVectorizing: Boolean,
+    vectorizeStatusMessage: String,
+    vectorizeOperation: OperationProgress,
+    onBuildVectors: () -> Unit,
+    onUnloadEmbeddingModel: () -> Unit,
+    onPauseVectorize: () -> Unit,
+    onResumeVectorize: () -> Unit,
+    onStopVectorize: () -> Unit
+) {
+    val isReady = embeddingTelemetry.status == EmbeddingRuntimeStatus.READY ||
+        embeddingTelemetry.status == EmbeddingRuntimeStatus.EMBEDDING
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(
+                        imageVector = Icons.Filled.Hub,
+                        contentDescription = "EmbeddingGemma telemetry",
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = embeddingTelemetry.loadedModelName,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = embeddingTelemetry.statusNote,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                if (isReady) {
+                    OutlinedButton(
+                        onClick = onUnloadEmbeddingModel,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("unload_embedding_button")
+                    ) {
+                        Text("Unload")
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TelemetryMetricPill(
+                    label = "DIMS",
+                    value = if (embeddingTelemetry.vectorDimensions > 0) "${embeddingTelemetry.vectorDimensions}-d" else "—",
+                    modifier = Modifier.weight(1f)
+                )
+                TelemetryMetricPill(
+                    label = "VECTORS",
+                    value = "$embeddedCount / $indexedCount",
+                    modifier = Modifier.weight(1f)
+                )
+                TelemetryMetricPill(
+                    label = "LATENCY",
+                    value = "${embeddingTelemetry.lastLatencyMs} ms",
+                    modifier = Modifier.weight(1f)
+                )
+                TelemetryMetricPill(
+                    label = "DELEGATE",
+                    value = embeddingTelemetry.activeDelegate.label,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            if (vectorizeOperation.isActiveOrPaused) {
+                Spacer(modifier = Modifier.height(10.dp))
+                OperationControlBar(
+                    operation = vectorizeOperation,
+                    onPause = onPauseVectorize,
+                    onResume = onResumeVectorize,
+                    onStop = onStopVectorize
+                )
+            }
+
+            if (vectorizeStatusMessage.isNotBlank() && !vectorizeOperation.isActiveOrPaused) {
+                Text(
+                    text = vectorizeStatusMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+            }
+
+            if (isReady && !vectorizeOperation.isActiveOrPaused) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = onBuildVectors,
+                    enabled = !isVectorizing,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("build_vectors_button"),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AutoFixHigh,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Build Vectors for Indexed Files")
+                }
+            }
         }
     }
 }
@@ -302,7 +524,9 @@ private fun TelemetryStripCard(
                 if (telemetry.status == EngineRuntimeStatus.READY) {
                     OutlinedButton(
                         onClick = onUnloadModel,
-                        modifier = Modifier.testTag("unload_model_button")
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("unload_model_button")
                     ) {
                         Text("Unload")
                     }
@@ -376,6 +600,8 @@ private fun ModelEntryCard(
     isLoading: Boolean,
     progressPct: Int,
     onDownload: () -> Unit,
+    onPauseDownload: () -> Unit,
+    onResumeDownload: () -> Unit,
     onCancel: () -> Unit,
     onLoad: () -> Unit,
     onUnload: () -> Unit,
@@ -442,20 +668,31 @@ private fun ModelEntryCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            if (model.status == "DOWNLOADING" || model.status == "VERIFYING") {
+            if (model.status == "DOWNLOADING" || model.status == "VERIFYING" || model.status == "PAUSED") {
+                val computedPct = if (progressPct > 0) {
+                    progressPct
+                } else if (model.expectedSizeBytes > 0L) {
+                    ((model.downloadedBytes * 100L) / model.expectedSizeBytes).toInt().coerceIn(0, 100)
+                } else 0
+
                 Spacer(modifier = Modifier.height(10.dp))
                 LinearProgressIndicator(
-                    progress = { (progressPct / 100f).coerceIn(0f, 1f) },
+                    progress = { (computedPct / 100f).coerceIn(0f, 1f) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(6.dp)
-                        .clip(RoundedCornerShape(4.dp))
+                        .clip(RoundedCornerShape(4.dp)),
+                    color = if (model.status == "PAUSED") {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    }
                 )
                 Text(
-                    text = if (model.status == "VERIFYING") {
-                        "Verifying SHA-256 & integrity..."
-                    } else {
-                        "Downloading into private filesDir ($progressPct%)"
+                    text = when (model.status) {
+                        "VERIFYING" -> "Verifying SHA-256 & integrity..."
+                        "PAUSED" -> "Paused at $computedPct% (${model.downloadedBytes / (1024 * 1024)} MB saved)"
+                        else -> "Downloading into private filesDir ($computedPct%)"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -525,10 +762,61 @@ private fun ModelEntryCard(
                     }
                     "DOWNLOADING", "VERIFYING" -> {
                         OutlinedButton(
-                            onClick = onCancel,
-                            modifier = Modifier.weight(1f)
+                            onClick = onPauseDownload,
+                            enabled = model.status == "DOWNLOADING",
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("pause_model_${model.modelId}")
                         ) {
-                            Text("Cancel Download")
+                            Text("Pause")
+                        }
+                        OutlinedButton(
+                            onClick = onCancel,
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("cancel_model_${model.modelId}"),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            )
+                        ) {
+                            Text("Stop")
+                        }
+                    }
+                    "PAUSED" -> {
+                        Button(
+                            onClick = onResumeDownload,
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("resume_model_${model.modelId}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PlayArrow,
+                                contentDescription = "Resume model download",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Resume")
+                        }
+                        OutlinedButton(
+                            onClick = onCancel,
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("cancel_model_${model.modelId}"),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            )
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Stop,
+                                contentDescription = "Stop model download",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Stop")
                         }
                     }
                     else -> {

@@ -47,6 +47,29 @@ object ModelCatalog {
             fileName = "gemma2-2b-it-gpu-int8.task",
             expectedSizeBytes = 1_900_000_000L,
             format = "TASK",
+            modelRole = "LLM",
+            recommendedBackend = "GPU"
+        ),
+        ModelRecordEntity(
+            modelId = "embeddinggemma-300m-litertlm",
+            displayName = "EmbeddingGemma 300M (LiteRT-LM)",
+            description = "On-device multilingual 768-dim text embedder powering hybrid semantic file & OCR search.",
+            downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300m.litertlm",
+            fileName = "embeddinggemma-300m.litertlm",
+            expectedSizeBytes = 205_000_000L,
+            format = "LITERTLM",
+            modelRole = "EMBEDDING",
+            recommendedBackend = "CPU"
+        ),
+        ModelRecordEntity(
+            modelId = "embeddinggemma-2-270m-litertlm",
+            displayName = "EmbeddingGemma 2 270M (LiteRT-LM)",
+            description = "Next-gen compact EmbeddingGemma 2 vector encoder for instant media & document similarity search.",
+            downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm/resolve/main/embeddinggemma-2-text-270m.litertlm",
+            fileName = "embeddinggemma-2-text-270m.litertlm",
+            expectedSizeBytes = 215_000_000L,
+            format = "LITERTLM",
+            modelRole = "EMBEDDING",
             recommendedBackend = "GPU"
         )
     )

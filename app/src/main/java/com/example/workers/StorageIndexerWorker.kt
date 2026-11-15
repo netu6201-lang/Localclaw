@@ -1,44 +1,47 @@
 package com.example.workers
 
 import android.content.Context
-import android.graphics.BitmapFactory
 import android.os.Environment
 import android.provider.MediaStore
-import android.webkit.MimeTypeMap
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.example.EdgeClawApplication
 import com.example.ai.agent.SandboxGuardrails
+import com.example.ai.engine.EmbeddingRuntimeStatus
+import com.example.ai.engine.VectorMath
 import com.example.data.db.EdgeClawDatabase
 import com.example.data.db.FileIndexEntity
 import com.example.data.preferences.AppPreferences
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.example.operations.OperationType
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.coroutines.resume
 
 class StorageIndexerWorker(
     appContext: Context,
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
-    private val textRecognizer by lazy {
-        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    }
-
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        PDFBoxResourceLoader.init(applicationContext)
+        val app = applicationContext as? EdgeClawApplication
         val db = EdgeClawDatabase.getInstance(applicationContext)
         val fileDao = db.fileIndexDao()
         val prefs = AppPreferences(applicationContext)
         val guardrails = SandboxGuardrails(applicationContext)
+        val embeddingManager = app?.container?.embeddingEngineManager
+        val extractor = app?.container?.mediaExtractor ?: MediaFileExtractor(applicationContext)
+        val opControl = app?.container?.operationControlManager
+
+        val isAutoTriggered = inputData.getBoolean(KEY_AUTO_TRIGGERED, false)
+        val opType = OperationType.STORAGE_SCAN
+        opControl?.start(
+            type = opType,
+            total = 0,
+            detail = if (isAutoTriggered) "Auto-scanning new media..." else "Discovering local files..."
+        )
 
         val discoveredPaths = LinkedHashMap<String, File>()
 
@@ -76,55 +79,83 @@ class StorageIndexerWorker(
         val total = discoveredPaths.size.coerceAtLeast(1)
         var processed = 0
         val batch = mutableListOf<FileIndexEntity>()
+        opControl?.updateProgress(opType, 0, total, "Indexing $total discovered file(s)...")
 
-        for ((_, file) in discoveredPaths) {
-            if (isStopped) break
-            processed++
+        try {
+            for ((_, file) in discoveredPaths) {
+                if (isStopped) break
+                opControl?.checkpoint(opType)
 
-            val existing = fileDao.getByPath(file.absolutePath)
-            if (existing != null && existing.lastModifiedMs == file.lastModified() && existing.sizeBytes == file.length()) {
-                continue
+                processed++
+                opControl?.updateProgress(opType, processed, total, "Scanning ${file.name}")
+
+                val embedTelemetry = embeddingManager?.telemetry?.value
+                val canEmbedNow = embedTelemetry?.status == EmbeddingRuntimeStatus.READY
+                val activeEmbedModelId = embedTelemetry?.loadedModelId.orEmpty()
+
+                val existing = fileDao.getByPath(file.absolutePath)
+                if (existing != null &&
+                    existing.lastModifiedMs == file.lastModified() &&
+                    existing.sizeBytes == file.length()
+                ) {
+                    if (canEmbedNow && activeEmbedModelId.isNotBlank() &&
+                        (existing.embeddingVector == null || existing.embeddingModelId != activeEmbedModelId)
+                    ) {
+                        val imageBytes = if (existing.fileCategory == "IMAGE") {
+                            extractor.loadDownsampledImageBytesFromFile(file)
+                        } else {
+                            null
+                        }
+                        val vec = embeddingManager?.embedDocument(
+                            title = existing.fileName,
+                            content = existing.extractedText,
+                            imageBytes = imageBytes
+                        )
+                        if (vec != null && vec.isNotEmpty()) {
+                            fileDao.updateFileEmbedding(
+                                fileId = existing.id,
+                                vector = VectorMath.floatArrayToBytes(vec),
+                                modelId = activeEmbedModelId
+                            )
+                        }
+                    }
+                    continue
+                }
+
+                batch += extractor.extractFileEntity(file, existing, embeddingManager)
+
+                if (batch.size >= 15) {
+                    fileDao.upsertFiles(batch.toList())
+                    batch.clear()
+                    setProgress(workDataOf(KEY_INDEXED_COUNT to processed, KEY_TOTAL_COUNT to total))
+                }
             }
 
-            val ext = file.extension.lowercase()
-            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-                ?: guessMimeByExtension(ext)
-            val category = categorize(ext, mime)
-
-            val extractedText = when (category) {
-                "IMAGE" -> runMlKitOcr(file)
-                "PDF" -> extractPdfText(file)
-                "DOCUMENT" -> extractPlainText(file)
-                else -> ""
-            }
-
-            batch += FileIndexEntity(
-                id = existing?.id ?: 0L,
-                filePath = file.absolutePath,
-                fileName = file.name,
-                parentDir = file.parent ?: "",
-                mimeType = mime,
-                fileCategory = category,
-                sizeBytes = file.length(),
-                lastModifiedMs = file.lastModified(),
-                extractedText = extractedText.take(8000),
-                isTrashed = false,
-                indexedAtMs = System.currentTimeMillis()
-            )
-
-            if (batch.size >= 20) {
+            if (batch.isNotEmpty()) {
                 fileDao.upsertFiles(batch.toList())
                 batch.clear()
-                setProgress(workDataOf(KEY_INDEXED_COUNT to processed, KEY_TOTAL_COUNT to total))
             }
-        }
+            prefs.setLastIndexedMs(System.currentTimeMillis())
 
-        if (batch.isNotEmpty()) {
-            fileDao.upsertFiles(batch.toList())
-        }
-        prefs.setLastIndexedMs(System.currentTimeMillis())
+            if (prefs.settingsFlow.first().autoScanNewMedia) {
+                app?.container?.mediaAutoScanScheduler?.armWorkManagerTrigger()
+            }
 
-        Result.success(workDataOf(KEY_INDEXED_COUNT to processed, KEY_TOTAL_COUNT to total))
+            opControl?.complete(opType, "Indexed $processed / $total file(s)")
+            Result.success(workDataOf(KEY_INDEXED_COUNT to processed, KEY_TOTAL_COUNT to total))
+        } catch (_: CancellationException) {
+            if (batch.isNotEmpty()) {
+                runCatching { fileDao.upsertFiles(batch.toList()) }
+            }
+            opControl?.stop(opType, "Scan stopped ($processed / $total saved)")
+            Result.failure()
+        } catch (t: Throwable) {
+            if (batch.isNotEmpty()) {
+                runCatching { fileDao.upsertFiles(batch.toList()) }
+            }
+            opControl?.fail(opType, t.message ?: "Indexing error")
+            Result.failure()
+        }
     }
 
     private fun scanMediaStore(outMap: MutableMap<String, File>) {
@@ -159,82 +190,11 @@ class StorageIndexerWorker(
         }
     }
 
-    private suspend fun runMlKitOcr(imageFile: File): String {
-        if (imageFile.length() > 15L * 1024L * 1024L) return ""
-        val bitmap = runCatching {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(imageFile.absolutePath, bounds)
-            val maxDim = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
-            val sample = (maxDim / 1280).coerceAtLeast(1)
-            BitmapFactory.decodeFile(
-                imageFile.absolutePath,
-                BitmapFactory.Options().apply { inSampleSize = sample }
-            )
-        }.getOrNull() ?: return ""
-
-        return try {
-            val inputImage = InputImage.fromBitmap(bitmap, 0)
-            suspendCancellableCoroutine { cont ->
-                textRecognizer.process(inputImage)
-                    .addOnSuccessListener { visionText ->
-                        if (cont.isActive) cont.resume(visionText.text.trim())
-                    }
-                    .addOnFailureListener {
-                        if (cont.isActive) cont.resume("")
-                    }
-            }
-        } catch (_: Throwable) {
-            ""
-        } finally {
-            bitmap.recycle()
-        }
-    }
-
-    private fun extractPdfText(pdfFile: File): String {
-        if (pdfFile.length() > 25L * 1024L * 1024L) return ""
-        return runCatching {
-            PDDocument.load(pdfFile).use { doc ->
-                val stripper = PDFTextStripper().apply {
-                    startPage = 1
-                    endPage = minOf(doc.numberOfPages, 8)
-                }
-                stripper.getText(doc).trim()
-            }
-        }.getOrDefault("")
-    }
-
-    private fun extractPlainText(file: File): String {
-        if (file.length() > 512L * 1024L) return ""
-        val ext = file.extension.lowercase()
-        if (ext !in setOf("txt", "md", "csv", "json", "log", "xml", "yaml", "yml", "kt", "py")) {
-            return ""
-        }
-        return runCatching { file.readText().take(6000) }.getOrDefault("")
-    }
-
-    private fun categorize(ext: String, mime: String): String = when {
-        mime.startsWith("image/") || ext in setOf("jpg", "jpeg", "png", "webp", "heic", "bmp") -> "IMAGE"
-        ext == "pdf" || mime == "application/pdf" -> "PDF"
-        mime.startsWith("video/") || ext in setOf("mp4", "mkv", "mov", "webm") -> "VIDEO"
-        mime.startsWith("audio/") || ext in setOf("mp3", "wav", "m4a", "flac", "ogg") -> "AUDIO"
-        ext in setOf("zip", "rar", "7z", "tar", "gz") -> "ARCHIVE"
-        ext in setOf("txt", "md", "csv", "json", "doc", "docx", "xls", "xlsx", "log", "xml") -> "DOCUMENT"
-        else -> "OTHER"
-    }
-
-    private fun guessMimeByExtension(ext: String): String = when (ext) {
-        "pdf" -> "application/pdf"
-        "md" -> "text/markdown"
-        "json" -> "application/json"
-        "csv" -> "text/csv"
-        "txt", "log" -> "text/plain"
-        "jpg", "jpeg" -> "image/jpeg"
-        "png" -> "image/png"
-        else -> "application/octet-stream"
-    }
-
     companion object {
         const val KEY_INDEXED_COUNT = "indexed_count"
         const val KEY_TOTAL_COUNT = "total_count"
+        const val KEY_AUTO_TRIGGERED = "auto_triggered"
+        const val TAG_INDEXER_WORK = "edgeclaw_indexer"
+        const val UNIQUE_INDEXER_WORK = "edgeclaw_storage_indexer"
     }
 }

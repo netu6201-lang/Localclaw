@@ -4,6 +4,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,12 +33,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.AutoMode
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Collections
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -48,15 +55,16 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
@@ -71,11 +79,15 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.example.ai.engine.EmbeddingRuntimeStatus
+import com.example.ai.engine.EmbeddingTelemetry
 import com.example.data.db.FileIndexEntity
+import com.example.operations.OperationProgress
+import com.example.operations.OperationType
+import com.example.ui.components.OperationControlBar
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -88,14 +100,23 @@ private val CATEGORIES = listOf("ALL", "IMAGE", "PDF", "DOCUMENT", "AUDIO", "VID
 fun ExplorerScreen(
     files: List<FileIndexEntity>,
     indexedCount: Int,
+    embeddedCount: Int,
+    embeddingTelemetry: EmbeddingTelemetry,
     searchQuery: String,
     selectedCategory: String,
     hasAllFilesAccess: Boolean,
     isIndexing: Boolean,
     indexStatusMessage: String,
+    autoScanNewMedia: Boolean,
+    operationStates: Map<OperationType, OperationProgress>,
     onSearchQueryChange: (String) -> Unit,
     onSelectCategory: (String) -> Unit,
     onStartIndexing: () -> Unit,
+    onScanSelectedMedia: (List<Uri>) -> Unit,
+    onToggleAutoScanNewMedia: (Boolean) -> Unit,
+    onPauseOperation: (OperationType) -> Unit,
+    onResumeOperation: (OperationType) -> Unit,
+    onStopOperation: (OperationType) -> Unit,
     onRequestMediaPermissions: () -> Unit,
     onAskAgentAboutFile: (FileIndexEntity) -> Unit,
     onSafeTrashFile: (FileIndexEntity) -> Unit,
@@ -103,6 +124,24 @@ fun ExplorerScreen(
 ) {
     val context = LocalContext.current
     var inspectedFile by remember { mutableStateOf<FileIndexEntity?>(null) }
+    val isHybridActive = embeddingTelemetry.status == EmbeddingRuntimeStatus.READY ||
+        embeddingTelemetry.status == EmbeddingRuntimeStatus.EMBEDDING
+
+    val singleMediaPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            onScanSelectedMedia(listOf(uri))
+        }
+    }
+
+    val multiMediaPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 50)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            onScanSelectedMedia(uris)
+        }
+    }
 
     Column(
         modifier = modifier
@@ -111,7 +150,7 @@ fun ExplorerScreen(
     ) {
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Header + Scan Action
+        // Header + Storage Scan Trigger
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -124,7 +163,7 @@ fun ExplorerScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    text = "$indexedCount files indexed • FTS4 + ML Kit OCR",
+                    text = "$indexedCount files • $embeddedCount vectorized",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -142,34 +181,139 @@ fun ExplorerScreen(
             ) {
                 Icon(
                     imageVector = Icons.Filled.Refresh,
-                    contentDescription = "Scan and OCR storage",
+                    contentDescription = "Scan full storage and OCR",
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                Text(if (isIndexing) "Indexing..." else "Scan & OCR")
+                Text(if (isIndexing) "Scanning..." else "Full Scan")
             }
         }
 
-        AnimatedVisibility(visible = isIndexing || indexStatusMessage.isNotBlank()) {
-            Column(modifier = Modifier.padding(top = 8.dp)) {
-                if (isIndexing) {
-                    LinearProgressIndicator(
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Scan Options Card: Single Media, Multiple Media, Full Storage, Auto-Scan Toggle
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilledTonalButton(
+                        onClick = {
+                            singleMediaPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                            )
+                        },
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(4.dp)),
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("scan_single_media_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PhotoLibrary,
+                            contentDescription = "Select one media item to scan",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("1 Media", maxLines = 1)
+                    }
+
+                    FilledTonalButton(
+                        onClick = {
+                            multiMediaPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                            )
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("scan_multiple_media_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Collections,
+                            contentDescription = "Select multiple media items to scan",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Multi Media", maxLines = 1)
+                    }
                 }
-                if (indexStatusMessage.isNotBlank()) {
-                    Text(
-                        text = indexStatusMessage,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp)
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AutoMode,
+                            contentDescription = "Auto scan new media",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = "Auto-Scan New Media",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Detect new photos, screenshots & videos automatically",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = autoScanNewMedia,
+                        onCheckedChange = { enabled ->
+                            if (enabled) onRequestMediaPermissions()
+                            onToggleAutoScanNewMedia(enabled)
+                        },
+                        modifier = Modifier.testTag("auto_scan_media_switch")
                     )
                 }
             }
+        }
+
+        // Active Pause / Resume / Stop Operation Bars for Storage Scan & Selected Media Scan
+        listOf(OperationType.STORAGE_SCAN, OperationType.MEDIA_PICK_SCAN).forEach { opType ->
+            val op = operationStates[opType]
+            if (op != null && op.isActiveOrPaused) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OperationControlBar(
+                    operation = op,
+                    onPause = { onPauseOperation(opType) },
+                    onResume = { onResumeOperation(opType) },
+                    onStop = { onStopOperation(opType) }
+                )
+            }
+        }
+
+        AnimatedVisibility(visible = !isIndexing && indexStatusMessage.isNotBlank()) {
+            Text(
+                text = indexStatusMessage,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp)
+            )
         }
 
         // MANAGE_EXTERNAL_STORAGE Grant Banner
@@ -230,7 +374,7 @@ fun ExplorerScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Instant FTS4 Search Bar
+        // Instant Hybrid / FTS4 Search Bar
         OutlinedTextField(
             value = searchQuery,
             onValueChange = onSearchQueryChange,
@@ -239,7 +383,11 @@ fun ExplorerScreen(
                 .testTag("explorer_search_input"),
             placeholder = {
                 Text(
-                    "Instant FTS4 search (OCR text, PDFs, filenames)...",
+                    text = if (isHybridActive) {
+                        "Hybrid search (semantic meaning + OCR + PDFs)..."
+                    } else {
+                        "Instant FTS4 search (OCR text, PDFs, filenames)..."
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -261,6 +409,51 @@ fun ExplorerScreen(
                 unfocusedContainerColor = MaterialTheme.colorScheme.surface
             )
         )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Active Search Engine Mode Pill
+        Surface(
+            color = if (isHybridActive) {
+                MaterialTheme.colorScheme.secondaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            },
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Hub,
+                    contentDescription = "Search mode",
+                    tint = if (isHybridActive) {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (isHybridActive) {
+                        "EmbeddingGemma Hybrid (${embeddingTelemetry.vectorDimensions}-dim) + FTS4"
+                    } else {
+                        "FTS4 Keyword Index • Load EmbeddingGemma in Models tab for semantic search"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isHybridActive) {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
 
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -364,10 +557,17 @@ fun ExplorerScreen(
                         .padding(10.dp)
                 )
 
-                if (file.fileCategory == "IMAGE" && File(file.filePath).exists()) {
+                val imageModel = remember(file.filePath) {
+                    when {
+                        file.filePath.startsWith("content://") -> Uri.parse(file.filePath)
+                        File(file.filePath).exists() -> File(file.filePath)
+                        else -> null
+                    }
+                }
+                if (file.fileCategory == "IMAGE" && imageModel != null) {
                     Spacer(modifier = Modifier.height(12.dp))
                     AsyncImage(
-                        model = File(file.filePath),
+                        model = imageModel,
                         contentDescription = file.fileName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
@@ -468,9 +668,14 @@ private fun FileIndexRowCard(
             modifier = Modifier.padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (file.fileCategory == "IMAGE" && File(file.filePath).exists()) {
+            val thumbModel = remember(file.filePath, file.fileCategory) {
+                if (file.fileCategory != "IMAGE") null
+                else if (file.filePath.startsWith("content://")) Uri.parse(file.filePath)
+                else File(file.filePath).takeIf { it.exists() }
+            }
+            if (thumbModel != null) {
                 AsyncImage(
-                    model = File(file.filePath),
+                    model = thumbModel,
                     contentDescription = file.fileName,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier

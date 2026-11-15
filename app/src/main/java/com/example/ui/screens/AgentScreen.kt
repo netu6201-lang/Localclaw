@@ -86,6 +86,8 @@ import com.example.ai.engine.EngineRuntimeStatus
 import com.example.ai.engine.LlmTelemetry
 import com.example.data.db.ActionLogEntity
 import com.example.data.db.AgentMemoryEntity
+import com.example.operations.OperationProgress
+import com.example.ui.components.OperationControlBar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -103,12 +105,16 @@ fun AgentScreen(
     messages: List<AgentChatMessage>,
     pendingConfirmation: PendingActionBatch?,
     isAgentBusy: Boolean,
+    agentOperation: OperationProgress,
     telemetry: LlmTelemetry,
     actionLogs: List<ActionLogEntity>,
     memoryRules: List<AgentMemoryEntity>,
     initialDraftPrompt: String,
     onConsumeDraftPrompt: () -> Unit,
     onSendPrompt: (String) -> Unit,
+    onPauseAgent: () -> Unit,
+    onResumeAgent: () -> Unit,
+    onStopAgent: () -> Unit,
     onApproveBatch: (Boolean) -> Unit,
     onUndoBatch: (String) -> Unit,
     onUpsertMemory: (String, String) -> Unit,
@@ -289,6 +295,17 @@ fun AgentScreen(
                     }
                 }
             }
+        }
+
+        // Active Agent Task Pause / Resume / Stop Bar
+        if (agentOperation.isActiveOrPaused) {
+            Spacer(modifier = Modifier.height(6.dp))
+            OperationControlBar(
+                operation = agentOperation,
+                onPause = onPauseAgent,
+                onResume = onResumeAgent,
+                onStop = onStopAgent
+            )
         }
 
         // Conversational Agent Input Bar (Text + Voice)

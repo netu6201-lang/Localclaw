@@ -35,11 +35,39 @@ data class FileIndexEntity(
     val lastModifiedMs: Long,
     @ColumnInfo(name = "extracted_text")
     val extractedText: String = "",
+    @ColumnInfo(name = "embedding_vector", typeAffinity = ColumnInfo.BLOB)
+    val embeddingVector: ByteArray? = null,
+    @ColumnInfo(name = "embedding_model_id")
+    val embeddingModelId: String = "",
     @ColumnInfo(name = "is_trashed")
     val isTrashed: Boolean = false,
     @ColumnInfo(name = "indexed_at_ms")
     val indexedAtMs: Long = System.currentTimeMillis()
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is FileIndexEntity) return false
+        return id == other.id &&
+            filePath == other.filePath &&
+            fileName == other.fileName &&
+            sizeBytes == other.sizeBytes &&
+            lastModifiedMs == other.lastModifiedMs &&
+            extractedText == other.extractedText &&
+            embeddingModelId == other.embeddingModelId &&
+            isTrashed == other.isTrashed &&
+            indexedAtMs == other.indexedAtMs &&
+            (embeddingVector contentEquals other.embeddingVector)
+    }
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + filePath.hashCode()
+        result = 31 * result + fileName.hashCode()
+        result = 31 * result + lastModifiedMs.hashCode()
+        result = 31 * result + (embeddingVector?.contentHashCode() ?: 0)
+        return result
+    }
+}
 
 @Fts4(
     contentEntity = FileIndexEntity::class,
@@ -125,6 +153,8 @@ data class ModelRecordEntity(
     val downloadedBytes: Long = 0L,
     @ColumnInfo(name = "format")
     val format: String, // LITERTLM or TASK
+    @ColumnInfo(name = "model_role")
+    val modelRole: String = "LLM", // LLM or EMBEDDING
     @ColumnInfo(name = "recommended_backend")
     val recommendedBackend: String, // NPU, GPU, CPU
     @ColumnInfo(name = "status")

@@ -3,6 +3,7 @@ package com.example.data.preferences
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -26,7 +27,8 @@ data class EngineSettings(
     val maxTokens: Int = 1024,
     val topK: Int = 32,
     val temperature: Float = 0.25f,
-    val lastIndexedMs: Long = 0L
+    val lastIndexedMs: Long = 0L,
+    val autoScanNewMedia: Boolean = false
 )
 
 class AppPreferences(private val context: Context) {
@@ -38,6 +40,7 @@ class AppPreferences(private val context: Context) {
         val TOP_K = intPreferencesKey("top_k")
         val TEMPERATURE = floatPreferencesKey("temperature")
         val LAST_INDEXED_MS = longPreferencesKey("last_indexed_ms")
+        val AUTO_SCAN_NEW_MEDIA = booleanPreferencesKey("auto_scan_new_media")
     }
 
     val settingsFlow: Flow<EngineSettings> = context.dataStore.data.map { prefs ->
@@ -50,7 +53,8 @@ class AppPreferences(private val context: Context) {
             maxTokens = prefs[Keys.MAX_TOKENS] ?: 1024,
             topK = prefs[Keys.TOP_K] ?: 32,
             temperature = prefs[Keys.TEMPERATURE] ?: 0.25f,
-            lastIndexedMs = prefs[Keys.LAST_INDEXED_MS] ?: 0L
+            lastIndexedMs = prefs[Keys.LAST_INDEXED_MS] ?: 0L,
+            autoScanNewMedia = prefs[Keys.AUTO_SCAN_NEW_MEDIA] ?: false
         )
     }
 
@@ -64,6 +68,10 @@ class AppPreferences(private val context: Context) {
 
     suspend fun setLastIndexedMs(timestamp: Long) {
         context.dataStore.edit { it[Keys.LAST_INDEXED_MS] = timestamp }
+    }
+
+    suspend fun setAutoScanNewMedia(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AUTO_SCAN_NEW_MEDIA] = enabled }
     }
 
     suspend fun updateSampling(maxTokens: Int, topK: Int, temperature: Float) {
