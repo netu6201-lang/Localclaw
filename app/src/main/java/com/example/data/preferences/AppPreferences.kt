@@ -21,6 +21,12 @@ enum class HardwareDelegate(val label: String, val subtitle: String) {
     CPU("CPU", "XNNPACK Multi-Thread")
 }
 
+enum class ScanMode(val label: String, val subtitle: String) {
+    MANUAL("Manual", "Pick 1 media item"),
+    AUTO_SCAN("Auto-Scan", "New arrivals"),
+    BATCH("Batch Scan", "Multiple files")
+}
+
 data class EngineSettings(
     val delegate: HardwareDelegate = HardwareDelegate.GPU,
     val activeModelId: String = "",
@@ -28,7 +34,8 @@ data class EngineSettings(
     val topK: Int = 32,
     val temperature: Float = 0.25f,
     val lastIndexedMs: Long = 0L,
-    val autoScanNewMedia: Boolean = false
+    val autoScanNewMedia: Boolean = false,
+    val scanMode: ScanMode = ScanMode.MANUAL
 )
 
 class AppPreferences(private val context: Context) {
@@ -41,12 +48,20 @@ class AppPreferences(private val context: Context) {
         val TEMPERATURE = floatPreferencesKey("temperature")
         val LAST_INDEXED_MS = longPreferencesKey("last_indexed_ms")
         val AUTO_SCAN_NEW_MEDIA = booleanPreferencesKey("auto_scan_new_media")
+        val SCAN_MODE = stringPreferencesKey("scan_mode")
     }
 
     val settingsFlow: Flow<EngineSettings> = context.dataStore.data.map { prefs ->
         val delegateName = prefs[Keys.DELEGATE] ?: HardwareDelegate.GPU.name
         val delegate = runCatching { HardwareDelegate.valueOf(delegateName) }
             .getOrDefault(HardwareDelegate.GPU)
+        val scanModeName = prefs[Keys.SCAN_MODE] ?: if (prefs[Keys.AUTO_SCAN_NEW_MEDIA] == true) {
+            ScanMode.AUTO_SCAN.name
+        } else {
+            ScanMode.MANUAL.name
+        }
+        val scanMode = runCatching { ScanMode.valueOf(scanModeName) }
+            .getOrDefault(ScanMode.MANUAL)
         EngineSettings(
             delegate = delegate,
             activeModelId = prefs[Keys.ACTIVE_MODEL_ID] ?: "",
@@ -54,7 +69,8 @@ class AppPreferences(private val context: Context) {
             topK = prefs[Keys.TOP_K] ?: 32,
             temperature = prefs[Keys.TEMPERATURE] ?: 0.25f,
             lastIndexedMs = prefs[Keys.LAST_INDEXED_MS] ?: 0L,
-            autoScanNewMedia = prefs[Keys.AUTO_SCAN_NEW_MEDIA] ?: false
+            autoScanNewMedia = prefs[Keys.AUTO_SCAN_NEW_MEDIA] ?: false,
+            scanMode = scanMode
         )
     }
 
@@ -71,7 +87,19 @@ class AppPreferences(private val context: Context) {
     }
 
     suspend fun setAutoScanNewMedia(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.AUTO_SCAN_NEW_MEDIA] = enabled }
+        context.dataStore.edit {
+            it[Keys.AUTO_SCAN_NEW_MEDIA] = enabled
+            if (enabled) {
+                it[Keys.SCAN_MODE] = ScanMode.AUTO_SCAN.name
+            }
+        }
+    }
+
+    suspend fun setScanMode(mode: ScanMode) {
+        context.dataStore.edit {
+            it[Keys.SCAN_MODE] = mode.name
+            it[Keys.AUTO_SCAN_NEW_MEDIA] = (mode == ScanMode.AUTO_SCAN)
+        }
     }
 
     suspend fun updateSampling(maxTokens: Int, topK: Int, temperature: Float) {

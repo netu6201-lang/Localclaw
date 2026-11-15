@@ -1,12 +1,6 @@
 package com.example.ui.screens
 
-import android.content.Intent
 import android.net.Uri
-import android.os.Build
-import android.provider.Settings
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,20 +27,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.AutoMode
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Collections
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.LockOpen
-import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -55,7 +46,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -64,7 +54,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
@@ -77,7 +66,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -104,16 +92,13 @@ fun ExplorerScreen(
     embeddingTelemetry: EmbeddingTelemetry,
     searchQuery: String,
     selectedCategory: String,
-    hasAllFilesAccess: Boolean,
     isIndexing: Boolean,
     indexStatusMessage: String,
-    autoScanNewMedia: Boolean,
     operationStates: Map<OperationType, OperationProgress>,
     onSearchQueryChange: (String) -> Unit,
     onSelectCategory: (String) -> Unit,
     onStartIndexing: () -> Unit,
-    onScanSelectedMedia: (List<Uri>) -> Unit,
-    onToggleAutoScanNewMedia: (Boolean) -> Unit,
+    onOpenSettings: () -> Unit,
     onPauseOperation: (OperationType) -> Unit,
     onResumeOperation: (OperationType) -> Unit,
     onStopOperation: (OperationType) -> Unit,
@@ -122,26 +107,9 @@ fun ExplorerScreen(
     onSafeTrashFile: (FileIndexEntity) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
     var inspectedFile by remember { mutableStateOf<FileIndexEntity?>(null) }
     val isHybridActive = embeddingTelemetry.status == EmbeddingRuntimeStatus.READY ||
         embeddingTelemetry.status == EmbeddingRuntimeStatus.EMBEDDING
-
-    val singleMediaPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            onScanSelectedMedia(listOf(uri))
-        }
-    }
-
-    val multiMediaPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 50)
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            onScanSelectedMedia(uris)
-        }
-    }
 
     Column(
         modifier = modifier
@@ -150,7 +118,7 @@ fun ExplorerScreen(
     ) {
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Header + Storage Scan Trigger
+        // Clean Header + Quick Scan & Scan Settings Shortcut
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -168,127 +136,45 @@ fun ExplorerScreen(
                     color = MaterialTheme.colorScheme.primary
                 )
             }
-            Button(
-                onClick = {
-                    onRequestMediaPermissions()
-                    onStartIndexing()
-                },
-                enabled = !isIndexing,
-                modifier = Modifier
-                    .minimumInteractiveComponentSize()
-                    .testTag("scan_storage_button"),
-                shape = RoundedCornerShape(12.dp)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Refresh,
-                    contentDescription = "Scan full storage and OCR",
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(if (isIndexing) "Scanning..." else "Full Scan")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Scan Options Card: Single Media, Multiple Media, Full Storage, Auto-Scan Toggle
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                OutlinedButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("explorer_scan_settings_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
-                    FilledTonalButton(
-                        onClick = {
-                            singleMediaPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                            )
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .minimumInteractiveComponentSize()
-                            .testTag("scan_single_media_button"),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.PhotoLibrary,
-                            contentDescription = "Select one media item to scan",
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("1 Media", maxLines = 1)
-                    }
-
-                    FilledTonalButton(
-                        onClick = {
-                            multiMediaPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                            )
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .minimumInteractiveComponentSize()
-                            .testTag("scan_multiple_media_button"),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Collections,
-                            contentDescription = "Select multiple media items to scan",
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Multi Media", maxLines = 1)
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.AutoMode,
-                            contentDescription = "Auto scan new media",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(
-                                text = "Auto-Scan New Media",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "Detect new photos, screenshots & videos automatically",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                    Switch(
-                        checked = autoScanNewMedia,
-                        onCheckedChange = { enabled ->
-                            if (enabled) onRequestMediaPermissions()
-                            onToggleAutoScanNewMedia(enabled)
-                        },
-                        modifier = Modifier.testTag("auto_scan_media_switch")
+                    Icon(
+                        imageVector = Icons.Filled.Tune,
+                        contentDescription = "Open scan settings",
+                        modifier = Modifier.size(16.dp)
                     )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Scan Mode")
+                }
+                Button(
+                    onClick = {
+                        onRequestMediaPermissions()
+                        onStartIndexing()
+                    },
+                    enabled = !isIndexing,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("explorer_quick_scan_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = "Run quick storage scan",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (isIndexing) "Scanning..." else "Scan")
                 }
             }
         }
@@ -314,62 +200,6 @@ fun ExplorerScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp)
             )
-        }
-
-        // MANAGE_EXTERNAL_STORAGE Grant Banner
-        AnimatedVisibility(visible = !hasAllFilesAccess && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 10.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
-                ),
-                shape = MaterialTheme.shapes.medium
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.LockOpen,
-                        contentDescription = "Storage access required",
-                        tint = MaterialTheme.colorScheme.onTertiaryContainer
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "All-Files Access Required",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer
-                        )
-                        Text(
-                            text = "Grant MANAGE_EXTERNAL_STORAGE so EdgeClaw can index PDFs & organize folders.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
-                        onClick = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                val intent = Intent(
-                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                    Uri.parse("package:${context.packageName}")
-                                )
-                                context.startActivity(intent)
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.tertiary,
-                            contentColor = MaterialTheme.colorScheme.onTertiary
-                        ),
-                        modifier = Modifier.testTag("grant_all_files_button")
-                    ) {
-                        Text("Grant")
-                    }
-                }
-            }
         }
 
         Spacer(modifier = Modifier.height(10.dp))

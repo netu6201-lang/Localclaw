@@ -28,7 +28,6 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Hub
-import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
@@ -36,8 +35,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -64,7 +61,6 @@ import com.example.ai.engine.EmbeddingTelemetry
 import com.example.ai.engine.EngineRuntimeStatus
 import com.example.ai.engine.LlmTelemetry
 import com.example.data.db.ModelRecordEntity
-import com.example.data.preferences.HardwareDelegate
 import com.example.operations.OperationProgress
 import com.example.operations.OperationType
 import com.example.ui.components.OperationControlBar
@@ -80,9 +76,7 @@ fun ModelGalleryScreen(
     isVectorizing: Boolean,
     vectorizeStatusMessage: String,
     operationStates: Map<OperationType, OperationProgress>,
-    selectedDelegate: HardwareDelegate,
     downloadProgress: Map<String, Int>,
-    onSelectDelegate: (HardwareDelegate) -> Unit,
     onDownloadModel: (ModelRecordEntity) -> Unit,
     onPauseDownload: (ModelRecordEntity) -> Unit,
     onResumeDownload: (ModelRecordEntity) -> Unit,
@@ -196,71 +190,6 @@ fun ModelGalleryScreen(
                 onResumeVectorize = { onResumeOperation(OperationType.VECTORIZE) },
                 onStopVectorize = { onStopOperation(OperationType.VECTORIZE) }
             )
-        }
-
-        // Hardware Delegate Selector (NPU / GPU / CPU)
-        item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(
-                        1.dp,
-                        MaterialTheme.colorScheme.outlineVariant,
-                        MaterialTheme.shapes.medium
-                    ),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Filled.Memory,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Hardware Acceleration Delegate",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        HardwareDelegate.entries.forEach { delegate ->
-                            val isSelected = selectedDelegate == delegate
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { onSelectDelegate(delegate) },
-                                label = {
-                                    Column {
-                                        Text(
-                                            text = delegate.label,
-                                            style = MaterialTheme.typography.labelLarge
-                                        )
-                                        Text(
-                                            text = delegate.subtitle,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("delegate_${delegate.name.lowercase()}"),
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
-                                )
-                            )
-                        }
-                    }
-                }
-            }
         }
 
         // Import Existing .litertlm / .task File from Device

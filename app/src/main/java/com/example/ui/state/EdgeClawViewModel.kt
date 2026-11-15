@@ -31,6 +31,7 @@ import com.example.data.db.FtsQuerySanitizer
 import com.example.data.db.ModelRecordEntity
 import com.example.data.preferences.EngineSettings
 import com.example.data.preferences.HardwareDelegate
+import com.example.data.preferences.ScanMode
 import com.example.operations.OperationProgress
 import com.example.operations.OperationStatus
 import com.example.operations.OperationType
@@ -59,6 +60,11 @@ import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+
+enum class SearchAgentMode(val label: String) {
+    SEARCH("Own Search"),
+    AGENT("Agent Help")
+}
 
 data class SearchScreenUiState(
     val query: String = "",
@@ -117,6 +123,9 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
     // Dedicated Search Screen State (Paginated Room FTS4 + Hybrid Vector)
     private val _searchScreenState = MutableStateFlow(SearchScreenUiState())
     val searchScreenState: StateFlow<SearchScreenUiState> = _searchScreenState.asStateFlow()
+
+    private val _searchAgentMode = MutableStateFlow(SearchAgentMode.SEARCH)
+    val searchAgentMode: StateFlow<SearchAgentMode> = _searchAgentMode.asStateFlow()
 
     private var vectorizeJob: Job? = null
     private var mediaPickJob: Job? = null
@@ -217,6 +226,10 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
 
     fun clearBanner() {
         _uiBannerMessage.value = null
+    }
+
+    fun setSearchAgentMode(mode: SearchAgentMode) {
+        _searchAgentMode.value = mode
     }
 
     // -------------------------------------------------------------------------
@@ -480,16 +493,21 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun setAutoScanNewMedia(enabled: Boolean) {
+    fun selectScanMode(mode: ScanMode) {
         viewModelScope.launch {
-            container.preferences.setAutoScanNewMedia(enabled)
-            container.mediaAutoScanScheduler.setAutoScanEnabled(enabled)
-            _uiBannerMessage.value = if (enabled) {
-                "Auto-scan ON: new photos, screenshots & videos will index automatically."
-            } else {
-                "Auto-scan OFF"
+            container.preferences.setScanMode(mode)
+            val autoEnabled = (mode == ScanMode.AUTO_SCAN)
+            container.mediaAutoScanScheduler.setAutoScanEnabled(autoEnabled)
+            _uiBannerMessage.value = when (mode) {
+                ScanMode.MANUAL -> "Manual Selection mode: pick individual media anytime."
+                ScanMode.AUTO_SCAN -> "Auto-Scan active: new arrivals will be scanned automatically."
+                ScanMode.BATCH -> "Batch Scan mode: process multiple files or full folders."
             }
         }
+    }
+
+    fun setAutoScanNewMedia(enabled: Boolean) {
+        selectScanMode(if (enabled) ScanMode.AUTO_SCAN else ScanMode.MANUAL)
     }
 
     // -------------------------------------------------------------------------
