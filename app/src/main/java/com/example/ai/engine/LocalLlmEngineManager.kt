@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Debug
 import com.example.data.preferences.HardwareDelegate
+import com.example.data.preferences.LlmProviderMode
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
@@ -15,6 +16,7 @@ import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.awaitClose
@@ -24,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -48,13 +51,17 @@ data class LlmTelemetry(
     val loadedModelPath: String = "",
     val requestedDelegate: HardwareDelegate = HardwareDelegate.GPU,
     val activeDelegate: HardwareDelegate = HardwareDelegate.GPU,
+    val providerMode: LlmProviderMode = LlmProviderMode.AUTO_FALLBACK,
+    val isUsingOllama: Boolean = false,
+    val ollamaBaseUrl: String = "http://127.0.0.1:11434",
+    val ollamaModelName: String = "gemma3:4b",
     val tokensPerSecond: Float = 0f,
     val totalTokensGenerated: Int = 0,
     val ttftMs: Long = 0L,
     val appPssRamMb: Int = 0,
     val systemAvailableRamMb: Int = 0,
     val systemTotalRamMb: Int = 0,
-    val statusNote: String = "Select or download an offline .litertlm / .task model"
+    val statusNote: String = "Select an offline Gemma model or configure Ollama API in Settings"
 )
 
 class LocalLlmEngineManager(private val context: Context) {
@@ -74,14 +81,97 @@ class LocalLlmEngineManager(private val context: Context) {
     private var mediaPipeInference: LlmInference? = null
     private var mediaPipeSession: LlmInferenceSession? = null
 
+    // Ollama HTTP API fallback & alternative LLM backend
+    private val ollamaClient = OllamaApiClient()
+    private val ollamaHistory = mutableListOf<OllamaChatMessage>()
+
     @Volatile
     private var activeFormat: String = ""
+
+    @Volatile
+    private var configuredProviderMode: LlmProviderMode = LlmProviderMode.AUTO_FALLBACK
+
+    @Volatile
+    private var configuredOllamaUrl: String = "http://127.0.0.1:11434"
+
+    @Volatile
+    private var configuredOllamaModel: String = "gemma3:4b"
+
+    @Volatile
+    private var configuredOllamaApiKey: String = ""
+
+    @Volatile
+    private var configuredMaxTokens: Int = 1024
+
+    @Volatile
+    private var configuredTemperature: Float = 0.25f
 
     private val _telemetry = MutableStateFlow(LlmTelemetry())
     val telemetry: StateFlow<LlmTelemetry> = _telemetry.asStateFlow()
 
     init {
         refreshMemoryTelemetry()
+    }
+
+    fun configureProvider(
+        mode: LlmProviderMode,
+        ollamaBaseUrl: String,
+        ollamaModelName: String,
+        ollamaApiKey: String = "",
+        maxTokens: Int = 1024,
+        temperature: Float = 0.25f
+    ) {
+        configuredProviderMode = mode
+        configuredOllamaUrl = ollamaBaseUrl.trim().trimEnd('/').ifBlank { "http://127.0.0.1:11434" }
+        configuredOllamaModel = ollamaModelName.trim().ifBlank { "gemma3:4b" }
+        configuredOllamaApiKey = ollamaApiKey.trim()
+        configuredMaxTokens = maxTokens
+        configuredTemperature = temperature
+
+        val localLoaded = hasLocalModelLoaded()
+        val usingOllama = (mode == LlmProviderMode.OLLAMA) ||
+            (mode == LlmProviderMode.AUTO_FALLBACK && !localLoaded && configuredOllamaModel.isNotBlank())
+
+        _telemetry.update { current ->
+            val updatedModelName = when {
+                localLoaded -> current.loadedModelName
+                mode == LlmProviderMode.OLLAMA -> "Ollama • $configuredOllamaModel"
+                else -> "No model loaded"
+            }
+            current.copy(
+                providerMode = mode,
+                ollamaBaseUrl = configuredOllamaUrl,
+                ollamaModelName = configuredOllamaModel,
+                loadedModelName = updatedModelName,
+                isUsingOllama = usingOllama,
+                statusNote = when {
+                    mode == LlmProviderMode.OLLAMA ->
+                        "Ollama API active (${configuredOllamaModel} @ ${configuredOllamaUrl})"
+                    localLoaded -> current.statusNote
+                    mode == LlmProviderMode.AUTO_FALLBACK ->
+                        "Standby • Will use Ollama ($configuredOllamaModel) if offline LLM unavailable"
+                    else -> "Select or download an offline .litertlm / .task model"
+                }
+            )
+        }
+    }
+
+    suspend fun testOllamaConnection(
+        baseUrl: String = configuredOllamaUrl,
+        apiKey: String = configuredOllamaApiKey
+    ): Result<List<String>> = ollamaClient.fetchAvailableModels(baseUrl, apiKey)
+
+    fun hasLocalModelLoaded(): Boolean =
+        (activeFormat == "LITERTLM" && liteRtConversation != null) ||
+            (activeFormat == "TASK" && mediaPipeSession != null)
+
+    fun isOllamaConfigured(): Boolean =
+        configuredOllamaUrl.isNotBlank() && configuredOllamaModel.isNotBlank()
+
+    fun isInferenceAvailable(): Boolean = when (configuredProviderMode) {
+        LlmProviderMode.ON_DEVICE -> hasLocalModelLoaded() && _telemetry.value.status == EngineRuntimeStatus.READY
+        LlmProviderMode.OLLAMA -> isOllamaConfigured()
+        LlmProviderMode.AUTO_FALLBACK -> (hasLocalModelLoaded() && _telemetry.value.status == EngineRuntimeStatus.READY) || isOllamaConfigured()
     }
 
     fun refreshMemoryTelemetry() {
@@ -142,6 +232,7 @@ class LocalLlmEngineManager(private val context: Context) {
                     loadedModelName = displayName,
                     loadedModelPath = modelPath,
                     requestedDelegate = requestedDelegate,
+                    isUsingOllama = configuredProviderMode == LlmProviderMode.OLLAMA,
                     statusNote = "Initializing $displayName on ${requestedDelegate.label}..."
                 )
             }
@@ -236,14 +327,13 @@ class LocalLlmEngineManager(private val context: Context) {
                     it.copy(
                         status = EngineRuntimeStatus.READY,
                         activeDelegate = candidate,
+                        isUsingOllama = configuredProviderMode == LlmProviderMode.OLLAMA,
                         statusNote = note
                     )
                 }
                 return
             } catch (t: Throwable) {
                 lastError = t
-                // Never call close() on an Engine whose initialize() threw if uninitialized,
-                // guard defensively so close exceptions do not mask fallback.
                 runCatching {
                     if (liteRtConversation != null) {
                         liteRtConversation?.close()
@@ -303,6 +393,7 @@ class LocalLlmEngineManager(private val context: Context) {
                     it.copy(
                         status = EngineRuntimeStatus.READY,
                         activeDelegate = candidate,
+                        isUsingOllama = configuredProviderMode == LlmProviderMode.OLLAMA,
                         statusNote = note
                     )
                 }
@@ -315,6 +406,10 @@ class LocalLlmEngineManager(private val context: Context) {
     }
 
     suspend fun resetConversation(systemInstruction: String, topK: Int = 32, temperature: Float = 0.25f) {
+        synchronized(ollamaHistory) {
+            ollamaHistory.clear()
+            ollamaHistory.add(OllamaChatMessage(role = "system", content = systemInstruction))
+        }
         withContext(engineDispatcher) {
             mutex.withLock {
                 if (activeFormat == "LITERTLM" && liteRtEngine != null) {
@@ -345,18 +440,141 @@ class LocalLlmEngineManager(private val context: Context) {
         }
     }
 
-    fun generateStreaming(prompt: String): Flow<String> = callbackFlow {
+    fun generateStreaming(prompt: String): Flow<String> {
+        val localReady = hasLocalModelLoaded() && _telemetry.value.status == EngineRuntimeStatus.READY
+        return when (configuredProviderMode) {
+            LlmProviderMode.OLLAMA -> generateOllamaStreaming(prompt)
+            LlmProviderMode.ON_DEVICE -> generateLocalStreaming(prompt)
+            LlmProviderMode.AUTO_FALLBACK -> {
+                if (localReady) {
+                    flow {
+                        var emittedAny = false
+                        try {
+                            generateLocalStreaming(prompt).collect { chunk ->
+                                emittedAny = true
+                                emit(chunk)
+                            }
+                        } catch (t: Throwable) {
+                            if (!emittedAny && t !is CancellationException && isOllamaConfigured()) {
+                                generateOllamaStreaming(prompt).collect { emit(it) }
+                            } else {
+                                throw t
+                            }
+                        }
+                    }
+                } else {
+                    generateOllamaStreaming(prompt)
+                }
+            }
+        }
+    }
+
+    private fun generateOllamaStreaming(prompt: String): Flow<String> = flow {
+        if (!isOllamaConfigured()) {
+            throw IllegalStateException("Ollama URL or model name not configured. Configure Ollama in Settings tab.")
+        }
+
+        val messagesSnapshot = synchronized(ollamaHistory) {
+            ollamaHistory.add(OllamaChatMessage(role = "user", content = prompt))
+            ollamaHistory.toList()
+        }
+
+        val previousStatus = _telemetry.value.status
+        val previousModelName = _telemetry.value.loadedModelName
+        val previousModelPath = _telemetry.value.loadedModelPath
+
+        _telemetry.update {
+            it.copy(
+                status = EngineRuntimeStatus.GENERATING,
+                isUsingOllama = true,
+                loadedModelName = "Ollama • $configuredOllamaModel",
+                tokensPerSecond = 0f,
+                totalTokensGenerated = 0,
+                ttftMs = 0L,
+                statusNote = "Streaming via Ollama ($configuredOllamaUrl)"
+            )
+        }
+
+        val startMs = System.currentTimeMillis()
+        var firstTokenMs = 0L
+        var chunkCount = 0
+        val assistantReply = StringBuilder()
+
+        try {
+            ollamaClient.streamChat(
+                baseUrl = configuredOllamaUrl,
+                model = configuredOllamaModel,
+                apiKey = configuredOllamaApiKey,
+                messages = messagesSnapshot,
+                temperature = configuredTemperature,
+                maxTokens = configuredMaxTokens
+            ).collect { chunk ->
+                if (chunk.isNotEmpty()) {
+                    assistantReply.append(chunk)
+                    val now = System.currentTimeMillis()
+                    if (firstTokenMs == 0L) {
+                        firstTokenMs = now - startMs
+                    }
+                    val approxTokens = chunk.split(Regex("\\s+")).count { it.isNotEmpty() }.coerceAtLeast(1)
+                    chunkCount += approxTokens
+                    val elapsedSec = ((now - startMs).coerceAtLeast(1L)) / 1000f
+                    _telemetry.update {
+                        it.copy(
+                            totalTokensGenerated = chunkCount,
+                            ttftMs = firstTokenMs,
+                            tokensPerSecond = (chunkCount / elapsedSec)
+                        )
+                    }
+                    emit(chunk)
+                }
+            }
+            synchronized(ollamaHistory) {
+                if (assistantReply.isNotEmpty()) {
+                    ollamaHistory.add(OllamaChatMessage(role = "assistant", content = assistantReply.toString()))
+                }
+            }
+            refreshMemoryTelemetry()
+            _telemetry.update {
+                it.copy(
+                    status = if (hasLocalModelLoaded()) EngineRuntimeStatus.READY else EngineRuntimeStatus.UNLOADED,
+                    loadedModelName = if (hasLocalModelLoaded()) previousModelName else "Ollama • $configuredOllamaModel",
+                    loadedModelPath = previousModelPath,
+                    statusNote = "Ollama ready ($configuredOllamaModel)"
+                )
+            }
+        } catch (e: CancellationException) {
+            _telemetry.update {
+                it.copy(
+                    status = if (hasLocalModelLoaded()) EngineRuntimeStatus.READY else previousStatus,
+                    statusNote = "Ollama request cancelled"
+                )
+            }
+            throw e
+        } catch (t: Throwable) {
+            _telemetry.update {
+                it.copy(
+                    status = if (hasLocalModelLoaded()) EngineRuntimeStatus.READY else EngineRuntimeStatus.ERROR,
+                    isUsingOllama = true,
+                    statusNote = "Ollama error: ${t.message ?: t::class.simpleName}"
+                )
+            }
+            throw t
+        }
+    }
+
+    private fun generateLocalStreaming(prompt: String): Flow<String> = callbackFlow {
         val conv = liteRtConversation
         val mpSession = mediaPipeSession
 
         if (_telemetry.value.status != EngineRuntimeStatus.READY) {
-            close(IllegalStateException("No local model loaded. Load a Gemma model in the Models tab first."))
+            close(IllegalStateException("No local model loaded. Load a Gemma model in Models or enable Ollama API in Settings."))
             return@callbackFlow
         }
 
         _telemetry.update {
             it.copy(
                 status = EngineRuntimeStatus.GENERATING,
+                isUsingOllama = false,
                 tokensPerSecond = 0f,
                 totalTokensGenerated = 0,
                 ttftMs = 0L
@@ -376,7 +594,6 @@ class LocalLlmEngineManager(private val context: Context) {
                         if (firstTokenMs == 0L) {
                             firstTokenMs = now - startMs
                         }
-                        // Approximate subword token count per streamed chunk
                         val approxTokens = chunk.split(Regex("\\s+")).count { it.isNotEmpty() }.coerceAtLeast(1)
                         chunkCount += approxTokens
                         val elapsedSec = ((now - startMs).coerceAtLeast(1L)) / 1000f
@@ -448,7 +665,7 @@ class LocalLlmEngineManager(private val context: Context) {
     }
 
     private suspend fun releaseInternal() {
-        while (_telemetry.value.status == EngineRuntimeStatus.GENERATING) {
+        while (_telemetry.value.status == EngineRuntimeStatus.GENERATING && !(_telemetry.value.isUsingOllama)) {
             runCatching { liteRtConversation?.cancelProcess() }
             delay(80)
         }
@@ -468,9 +685,18 @@ class LocalLlmEngineManager(private val context: Context) {
             it.copy(
                 status = EngineRuntimeStatus.UNLOADED,
                 loadedModelId = "",
-                loadedModelName = "No model loaded",
+                loadedModelName = if (configuredProviderMode == LlmProviderMode.OLLAMA) {
+                    "Ollama • $configuredOllamaModel"
+                } else {
+                    "No model loaded"
+                },
                 loadedModelPath = "",
-                statusNote = "Engine unloaded"
+                isUsingOllama = configuredProviderMode == LlmProviderMode.OLLAMA,
+                statusNote = if (configuredProviderMode == LlmProviderMode.OLLAMA) {
+                    "Ollama API active ($configuredOllamaModel)"
+                } else {
+                    "Engine unloaded"
+                }
             )
         }
     }

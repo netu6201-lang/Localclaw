@@ -130,6 +130,9 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
 
     val searchScreenState by viewModel.searchScreenState.collectAsStateWithLifecycle()
     val searchAgentMode by viewModel.searchAgentMode.collectAsStateWithLifecycle()
+    val ollamaModels by viewModel.ollamaModels.collectAsStateWithLifecycle()
+    val ollamaTestStatus by viewModel.ollamaTestStatus.collectAsStateWithLifecycle()
+    val isTestingOllama by viewModel.isTestingOllama.collectAsStateWithLifecycle()
     val operationStates by viewModel.operationStates.collectAsStateWithLifecycle()
 
     val models by viewModel.models.collectAsStateWithLifecycle()
@@ -374,11 +377,21 @@ fun EdgeClawApp(viewModel: EdgeClawViewModel) {
                                 embeddedCount = embeddedCount,
                                 hasAllFilesAccess = hasAllFilesAccess,
                                 selectedDelegate = engineSettings.delegate,
+                                llmProviderMode = engineSettings.llmProviderMode,
+                                ollamaBaseUrl = engineSettings.ollamaBaseUrl,
+                                ollamaModelName = engineSettings.ollamaModelName,
+                                ollamaApiKey = engineSettings.ollamaApiKey,
+                                ollamaModels = ollamaModels,
+                                ollamaTestStatus = ollamaTestStatus,
+                                isTestingOllama = isTestingOllama,
                                 operationStates = operationStates,
                                 onSelectScanMode = viewModel::selectScanMode,
                                 onScanSelectedMedia = viewModel::scanSelectedMedia,
                                 onStartFullBatchScan = viewModel::startStorageIndexing,
                                 onSelectDelegate = viewModel::selectHardwareDelegate,
+                                onSelectLlmProviderMode = viewModel::selectLlmProviderMode,
+                                onSaveOllamaConfig = viewModel::saveOllamaConfig,
+                                onTestOllamaConnection = viewModel::testAndFetchOllamaModels,
                                 onPauseOperation = viewModel::pauseOperation,
                                 onResumeOperation = viewModel::resumeOperation,
                                 onStopOperation = viewModel::stopOperation,

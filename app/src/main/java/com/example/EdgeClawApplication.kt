@@ -1,6 +1,7 @@
 package com.example
 
 import android.app.Application
+import com.example.ai.agent.AgentSystemToolbox
 import com.example.ai.agent.FileAgentOrchestrator
 import com.example.ai.agent.FileOperationsExecutor
 import com.example.ai.agent.SandboxGuardrails
@@ -38,6 +39,19 @@ class AppContainer(application: Application) {
         fileIndexDao = database.fileIndexDao(),
         actionLogDao = database.actionLogDao()
     )
+    val agentSystemToolbox: AgentSystemToolbox = AgentSystemToolbox(
+        context = application,
+        preferences = preferences,
+        mediaAutoScanScheduler = mediaAutoScanScheduler,
+        llmEngineManager = llmEngineManager,
+        embeddingEngineManager = embeddingEngineManager,
+        fileIndexDao = database.fileIndexDao(),
+        modelRecordDao = database.modelRecordDao(),
+        actionLogDao = database.actionLogDao(),
+        mediaExtractor = mediaExtractor,
+        guardrails = guardrails,
+        operationControlManager = operationControlManager
+    )
     val agentOrchestrator: FileAgentOrchestrator = FileAgentOrchestrator(
         llmEngineManager = llmEngineManager,
         hybridSearchEngine = hybridSearchEngine,
@@ -45,7 +59,8 @@ class AppContainer(application: Application) {
         agentMemoryDao = database.agentMemoryDao(),
         fileOpsExecutor = fileOpsExecutor,
         guardrails = guardrails,
-        operationControlManager = operationControlManager
+        operationControlManager = operationControlManager,
+        systemToolbox = agentSystemToolbox
     )
 }
 
@@ -62,9 +77,19 @@ class EdgeClawApplication : Application() {
 
         appScope.launch {
             container.database.modelRecordDao().insertIgnore(ModelCatalog.defaultModels)
-            val settings = container.preferences.settingsFlow.first()
-            if (settings.autoScanNewMedia) {
+            val initial = container.preferences.settingsFlow.first()
+            if (initial.autoScanNewMedia) {
                 container.mediaAutoScanScheduler.setAutoScanEnabled(true)
+            }
+            container.preferences.settingsFlow.collect { settings ->
+                container.llmEngineManager.configureProvider(
+                    mode = settings.llmProviderMode,
+                    ollamaBaseUrl = settings.ollamaBaseUrl,
+                    ollamaModelName = settings.ollamaModelName,
+                    ollamaApiKey = settings.ollamaApiKey,
+                    maxTokens = settings.maxTokens,
+                    temperature = settings.temperature
+                )
             }
         }
     }

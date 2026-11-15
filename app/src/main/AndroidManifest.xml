@@ -39,7 +39,8 @@
         android:requestLegacyExternalStorage="true"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.MyApplication">
+        android:theme="@style/Theme.MyApplication"
+        android:usesCleartextTraffic="true">
 
         <!-- Native GPU/OpenCL & NPU/Hexagon DSP Hardware Acceleration Libraries -->
         <uses-native-library

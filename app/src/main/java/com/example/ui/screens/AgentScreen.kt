@@ -86,6 +86,7 @@ import com.example.ai.engine.EngineRuntimeStatus
 import com.example.ai.engine.LlmTelemetry
 import com.example.data.db.ActionLogEntity
 import com.example.data.db.AgentMemoryEntity
+import com.example.data.preferences.LlmProviderMode
 import com.example.operations.OperationProgress
 import com.example.ui.components.OperationControlBar
 import java.text.SimpleDateFormat
@@ -93,10 +94,10 @@ import java.util.Date
 import java.util.Locale
 
 private val QUICK_PROMPTS = listOf(
-    "Find electricity bills and summarize",
-    "Organize receipts into /Documents/Receipts",
-    "Remember: put invoices in /Documents/Invoices",
-    "Find large downloads from the last 7 days"
+    "भूरी फोटो और बिल ढूंढो",
+    "Show current app settings",
+    "Enable Auto-Scan mode",
+    "Find electricity bills and organize into /Documents/Bills"
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -193,22 +194,26 @@ fun AgentScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.clickable(onClick = onOpenModelsTab)
                 ) {
-                    val statusColor = if (telemetry.status == EngineRuntimeStatus.READY ||
+                    val isLocalReady = telemetry.status == EngineRuntimeStatus.READY ||
                         telemetry.status == EngineRuntimeStatus.GENERATING
-                    ) {
+                    val isOllamaActive = telemetry.isUsingOllama &&
+                        (telemetry.providerMode == LlmProviderMode.OLLAMA || telemetry.providerMode == LlmProviderMode.AUTO_FALLBACK)
+                    val statusColor = if (isLocalReady || isOllamaActive) {
                         MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.tertiary
                     }
                     Text(
-                        text = if (telemetry.status == EngineRuntimeStatus.READY ||
-                            telemetry.status == EngineRuntimeStatus.GENERATING
-                        ) {
-                            "${telemetry.loadedModelName} • ${telemetry.activeDelegate.label} • ${
-                                String.format(Locale.US, "%.1f", telemetry.tokensPerSecond)
-                            } tok/s"
-                        } else {
-                            "No LLM loaded (FTS4 Assist Active) • Tap to load model"
+                        text = when {
+                            isLocalReady && !telemetry.isUsingOllama ->
+                                "${telemetry.loadedModelName} • ${telemetry.activeDelegate.label} • ${
+                                    String.format(Locale.US, "%.1f", telemetry.tokensPerSecond)
+                                } tok/s"
+                            isOllamaActive ->
+                                "Ollama • ${telemetry.ollamaModelName} • ${
+                                    String.format(Locale.US, "%.1f", telemetry.tokensPerSecond)
+                                } tok/s"
+                            else -> "Offline Tool & Cross-Script Assist • Tap to load LLM"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = statusColor,

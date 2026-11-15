@@ -1,6 +1,5 @@
 package com.example.ai.agent
 
-import com.example.ai.engine.EngineRuntimeStatus
 import com.example.ai.engine.HybridSearchEngine
 import com.example.ai.engine.LocalLlmEngineManager
 import com.example.data.db.AgentMemoryDao
@@ -8,6 +7,7 @@ import com.example.data.db.AgentMemoryEntity
 import com.example.data.db.FileIndexDao
 import com.example.data.db.FileIndexEntity
 import com.example.data.db.FtsQuerySanitizer
+import com.example.data.preferences.LlmProviderMode
 import com.example.operations.OperationControlManager
 import com.example.operations.OperationType
 import kotlinx.coroutines.CancellationException
@@ -28,8 +28,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Core ReAct Agentic Loop (Plan -> Tool Call -> Execute -> Observe -> Respond)
- * bound strictly to local Room FTS4, EmbeddingGemma vector search, ML Kit OCR/PDF text,
- * and sandboxed Kotlin file operations.
+ * supporting both On-Device Gemma/Qwen AND Ollama API, with full access to all
+ * file/search/model/scan tools AND EdgeClaw App Settings.
  */
 class FileAgentOrchestrator(
     private val llmEngineManager: LocalLlmEngineManager,
@@ -38,7 +38,8 @@ class FileAgentOrchestrator(
     private val agentMemoryDao: AgentMemoryDao,
     private val fileOpsExecutor: FileOperationsExecutor,
     private val guardrails: SandboxGuardrails,
-    private val operationControlManager: OperationControlManager
+    private val operationControlManager: OperationControlManager,
+    private val systemToolbox: AgentSystemToolbox
 ) {
 
     private val json = Json {
@@ -113,7 +114,7 @@ class FileAgentOrchestrator(
         activeAssistantMsgId = assistantMsgId
         val traces = mutableListOf<AgentStepTrace>()
 
-        val maxSteps = 5
+        val maxSteps = 8
         operationControlManager.start(
             type = OperationType.AGENT_TASK,
             total = maxSteps,
@@ -132,26 +133,30 @@ class FileAgentOrchestrator(
 
         try {
             operationControlManager.checkpoint(OperationType.AGENT_TASK)
-            val engineReady = llmEngineManager.telemetry.value.status == EngineRuntimeStatus.READY
-            if (!engineReady) {
+            val inferenceReady = llmEngineManager.isInferenceAvailable()
+            if (!inferenceReady) {
                 val fallbackTrace = AgentStepTrace(
                     stage = TraceStage.PLAN,
-                    title = "Engine Standby -> Direct Hybrid/FTS4 Assist",
-                    detail = "No .litertlm/.task LLM loaded yet. Executing direct offline Hybrid + FTS4 + Memory lookup."
+                    title = "Engine Standby -> Direct Tool & Cross-Script Assist",
+                    detail = "No local LLM loaded and Ollama not configured. Executing direct tool/settings/search assist."
                 )
                 traces += fallbackTrace
                 operationControlManager.checkpoint(OperationType.AGENT_TASK)
                 val localAnswer = runDirectOfflineAssist(userText.trim(), traces)
                 updateAssistantMessage(assistantMsgId, localAnswer, traces, isStreaming = false)
-                operationControlManager.complete(OperationType.AGENT_TASK, "Completed offline lookup")
+                operationControlManager.complete(OperationType.AGENT_TASK, "Completed offline assist")
                 return@withContext
             }
 
-            // Refresh system prompt with current persisted agent_memory rules
+            // Refresh system prompt with live app_settings + persisted agent_memory rules
             val rulesSummary = agentMemoryDao.getAll()
                 .take(10)
                 .joinToString("\n") { "- [${it.memoryKey}]: ${it.ruleText}" }
-            val systemPrompt = AgentPromptAndSchema.buildSystemPrompt(userRulesSummary = rulesSummary)
+            val settingsSummary = systemToolbox.getAppSettingsSummary()
+            val systemPrompt = AgentPromptAndSchema.buildSystemPrompt(
+                userRulesSummary = rulesSummary,
+                currentSettingsSummary = settingsSummary
+            )
             llmEngineManager.resetConversation(systemPrompt)
 
             var currentTurnPrompt = "User request: $userText"
@@ -168,16 +173,40 @@ class FileAgentOrchestrator(
                 )
 
                 val streamBuffer = StringBuilder()
-                llmEngineManager.generateStreaming(currentTurnPrompt).collect { chunk ->
-                    operationControlManager.checkpoint(OperationType.AGENT_TASK)
-                    streamBuffer.append(chunk)
-                    val displayPreview = stripToolMarkupForPreview(streamBuffer.toString())
-                    updateAssistantMessage(
-                        assistantMsgId,
-                        displayPreview.ifBlank { "Step $step: Reasoning..." },
-                        traces,
-                        isStreaming = true
-                    )
+                try {
+                    llmEngineManager.generateStreaming(currentTurnPrompt).collect { chunk ->
+                        operationControlManager.checkpoint(OperationType.AGENT_TASK)
+                        streamBuffer.append(chunk)
+                        val displayPreview = stripToolMarkupForPreview(streamBuffer.toString())
+                        updateAssistantMessage(
+                            assistantMsgId,
+                            displayPreview.ifBlank { "Step $step: Reasoning..." },
+                            traces,
+                            isStreaming = true
+                        )
+                    }
+                } catch (streamErr: Throwable) {
+                    if (streamErr is CancellationException) throw streamErr
+                    val telemetrySnapshot = llmEngineManager.telemetry.value
+                    // If Ollama wasn't running during first step in AUTO_FALLBACK (or explicit OLLAMA),
+                    // gracefully execute direct offline tool/search assist and include diagnostic note.
+                    if (step == 1 && streamBuffer.isEmpty()) {
+                        traces += AgentStepTrace(
+                            stage = TraceStage.ERROR,
+                            title = "LLM Connection / Runtime Fallback",
+                            detail = "${streamErr.message ?: "Unavailable"} -> Running direct offline assist."
+                        )
+                        val direct = runDirectOfflineAssist(userText.trim(), traces)
+                        val note = if (telemetrySnapshot.providerMode == LlmProviderMode.OLLAMA) {
+                            "[Ollama API unreachable at ${telemetrySnapshot.ollamaBaseUrl}: ${streamErr.message}]\n\n$direct"
+                        } else {
+                            "[LLM Standby (${streamErr.message ?: "not running"}) -> Direct Offline Assist]\n\n$direct"
+                        }
+                        updateAssistantMessage(assistantMsgId, note, traces, isStreaming = false)
+                        operationControlManager.complete(OperationType.AGENT_TASK, "Completed via offline fallback")
+                        return@withContext
+                    }
+                    throw streamErr
                 }
 
                 val rawOutput = streamBuffer.toString().trim()
@@ -222,7 +251,7 @@ class FileAgentOrchestrator(
                 traces += AgentStepTrace(
                     stage = TraceStage.OBSERVE,
                     title = "Observation (${parsedTool.tool})",
-                    detail = observation.take(400)
+                    detail = observation.take(450)
                 )
                 updateAssistantMessage(assistantMsgId, "Analyzing observation...", traces, isStreaming = true)
 
@@ -283,10 +312,69 @@ class FileAgentOrchestrator(
         userText: String,
         traces: MutableList<AgentStepTrace>
     ): String {
-        val ftsQuery = FtsQuerySanitizer.toSafeFtsQuery(userText)
+        val lower = userText.lowercase(Locale.US)
+
+        // Check direct settings / scan / model commands even when LLM isn't loaded
+        if (lower.contains("auto scan") || lower.contains("auto-scan") || lower.contains("ऑटो स्कैन")) {
+            val mode = if (lower.contains("off") || lower.contains("disable") || lower.contains("band")) "MANUAL" else "AUTO_SCAN"
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: update_app_settings", detail = "{\"scan_mode\":\"$mode\"}")
+            val out = systemToolbox.updateAppSettings(UpdateAppSettingsArgs(scanMode = mode))
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (update_app_settings)", detail = out)
+            return out
+        }
+
+        if (lower.contains("batch scan") || lower.contains("बैच स्कैन")) {
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: update_app_settings", detail = "{\"scan_mode\":\"BATCH\"}")
+            val out = systemToolbox.updateAppSettings(UpdateAppSettingsArgs(scanMode = "BATCH"))
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (update_app_settings)", detail = out)
+            return out
+        }
+
+        if (lower.contains("manual scan") || lower.contains("manual selection")) {
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: update_app_settings", detail = "{\"scan_mode\":\"MANUAL\"}")
+            val out = systemToolbox.updateAppSettings(UpdateAppSettingsArgs(scanMode = "MANUAL"))
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (update_app_settings)", detail = out)
+            return out
+        }
+
+        if ((lower.contains("setting") || lower.contains("सेटिंग") || lower.contains("status")) &&
+            !lower.contains("search") && !lower.contains("find")
+        ) {
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: get_app_settings", detail = "{}")
+            val out = systemToolbox.getAppSettingsSummary()
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (get_app_settings)", detail = out)
+            return "Current EdgeClaw Settings:\n$out"
+        }
+
+        if (lower.contains("scan storage") || lower.contains("start scan") || lower.contains("full scan") || lower.contains("स्कैन शुरू")) {
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: scan_storage", detail = "{\"action\":\"FULL_SCAN\"}")
+            val out = systemToolbox.handleScanStorage("FULL_SCAN")
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (scan_storage)", detail = out)
+            return out
+        }
+
+        if (lower.contains("list model") || lower.contains("test ollama") || lower.contains("ollama models")) {
+            val action = if (lower.contains("test ollama")) "TEST_OLLAMA" else "LIST"
+            traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: manage_models", detail = "{\"action\":\"$action\"}")
+            val out = systemToolbox.handleManageModels(ManageModelsArgs(action = action))
+            traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (manage_models)", detail = out)
+            return out
+        }
+
+        if (lower.contains("undo") || lower.contains("वापस")) {
+            val latest = systemToolbox.getLatestUndoableBatchId()
+            if (latest != null) {
+                traces += AgentStepTrace(stage = TraceStage.TOOL_CALL, title = "Tool: undo_batch", detail = "{\"batch_id\":\"$latest\"}")
+                val rep = fileOpsExecutor.undoBatch(latest)
+                traces += AgentStepTrace(stage = TraceStage.OBSERVE, title = "Observation (undo_batch)", detail = rep.message)
+                return rep.message
+            }
+        }
+
+        val ftsQuery = FtsQuerySanitizer.toCrossScriptFtsQuery(userText)
         val hits = hybridSearchEngine.search(
             rawQuery = userText,
-            limit = 8
+            limit = 10
         )
         val usedSemantic = hits.any { it.semanticSimilarity > 0f }
         val memories = agentMemoryDao.queryByKeyword(userText.take(24), limit = 5)
@@ -294,23 +382,23 @@ class FileAgentOrchestrator(
         traces += AgentStepTrace(
             stage = TraceStage.TOOL_CALL,
             title = "Tool: search_files",
-            detail = "{\"query\": \"${ftsQuery.ifBlank { userText }}\", \"mode\": \"${if (usedSemantic) "HYBRID_VECTOR_FTS4" else "FTS4"}\"}"
+            detail = "{\"query\": \"${ftsQuery.ifBlank { userText }}\", \"mode\": \"${if (usedSemantic) "HYBRID_CROSS_SCRIPT" else "FTS4_CROSS_SCRIPT"}\"}"
         )
         traces += AgentStepTrace(
             stage = TraceStage.OBSERVE,
             title = "Observation (search_files)",
-            detail = "Found ${hits.size} ${if (usedSemantic) "Hybrid (FTS4 + EmbeddingGemma)" else "FTS4"} match(es), ${memories.size} memory rule(s)."
+            detail = "Found ${hits.size} cross-script match(es), ${memories.size} memory rule(s)."
         )
 
         return buildString {
             val header = if (usedSemantic) {
-                "Offline Hybrid Search (EmbeddingGemma + FTS4)"
+                "Offline Cross-Script Hybrid Search (Hindi + English + EmbeddingGemma)"
             } else {
-                "Offline FTS4 Index Result"
+                "Offline Cross-Script Search (Hindi + Hinglish + FTS4)"
             }
-            append("$header (Load an Agent LLM in the Models tab for full autonomous reasoning & multi-step file organization):\n\n")
+            append("$header (Load Gemma in Models or configure Ollama API in Settings for full multi-step AI reasoning):\n\n")
             if (hits.isEmpty()) {
-                append("No indexed files matched \"$userText\". Try tapping 'Scan & OCR' in the Explorer tab.")
+                append("No indexed files matched \"$userText\". Try scanning media/folders in Settings -> Scan Mode.")
             } else {
                 append("Matched ${hits.size} file(s):\n")
                 hits.forEachIndexed { index, hit ->
@@ -358,7 +446,7 @@ class FileAgentOrchestrator(
                         limit = 20
                     )
                     if (hits.isEmpty()) {
-                        "No matching files found in SQLite FTS4 or EmbeddingGemma vector index."
+                        "No matching files found in SQLite FTS4, cross-script transliteration, or EmbeddingGemma vector index."
                     } else {
                         hits.joinToString("\n") { hit ->
                             val f = hit.file
@@ -416,12 +504,16 @@ class FileAgentOrchestrator(
                 }
             }
 
+            "list_directory" -> {
+                val args = decodeArgs<ListDirectoryArgs>(call.args) ?: ListDirectoryArgs()
+                systemToolbox.listDirectory(args.path)
+            }
+
             "file_action" -> {
                 val args = decodeArgs<FileActionArgs>(call.args)
                     ?: return "Error: Invalid file_action arguments."
                 val op = args.operation.uppercase().trim()
 
-                // Safety Guardrail: Any batch move/copy/rename affecting >3 files pauses for Approve/Reject
                 if (op in setOf("MOVE", "COPY", "RENAME") && args.sourcePaths.size > 3) {
                     val batchId = UUID.randomUUID().toString()
                     val approved = requestHumanConfirmation(
@@ -472,6 +564,18 @@ class FileAgentOrchestrator(
                 report.message
             }
 
+            "undo_batch" -> {
+                val args = decodeArgs<UndoBatchArgs>(call.args) ?: UndoBatchArgs()
+                val targetBatch = args.batchId.trim().ifBlank {
+                    systemToolbox.getLatestUndoableBatchId() ?: ""
+                }
+                if (targetBatch.isBlank()) {
+                    "No active undoable file operation batch found in action_logs."
+                } else {
+                    fileOpsExecutor.undoBatch(targetBatch).message
+                }
+            }
+
             "memory_upsert" -> {
                 val args = decodeArgs<MemoryUpsertArgs>(call.args)
                     ?: return "Error: Missing key or rule_text."
@@ -499,7 +603,27 @@ class FileAgentOrchestrator(
                 }
             }
 
-            else -> "Unknown tool '${call.tool}'. Available: search_files, read_file_summary, file_action, safe_trash, memory_upsert, memory_query."
+            "scan_storage" -> {
+                val args = decodeArgs<ScanStorageArgs>(call.args) ?: ScanStorageArgs()
+                systemToolbox.handleScanStorage(args.action)
+            }
+
+            "manage_models" -> {
+                val args = decodeArgs<ManageModelsArgs>(call.args) ?: ManageModelsArgs()
+                systemToolbox.handleManageModels(args)
+            }
+
+            "get_app_settings" -> {
+                systemToolbox.getAppSettingsSummary()
+            }
+
+            "update_app_settings" -> {
+                val args = decodeArgs<UpdateAppSettingsArgs>(call.args)
+                    ?: return "Error: Invalid update_app_settings arguments."
+                systemToolbox.updateAppSettings(args)
+            }
+
+            else -> "Unknown tool '${call.tool}'. Available: search_files, read_file_summary, list_directory, file_action, safe_trash, undo_batch, memory_upsert, memory_query, scan_storage, manage_models, get_app_settings, update_app_settings."
         }
     }
 

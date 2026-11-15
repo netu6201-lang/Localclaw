@@ -99,7 +99,7 @@ private val DATE_RANGES = listOf(
     "LAST_7_DAYS" to "7 days",
     "LAST_30_DAYS" to "30 days"
 )
-private val QUICK_FTS_SUGGESTIONS = listOf("invoice", "receipt", "passport", "electricity", "pdf", "screenshot")
+private val QUICK_FTS_SUGGESTIONS = listOf("भूरी", "बिजली बिल", "रसीद", "invoice", "receipt", "screenshot", "pdf")
 
 /**
  * High-performance Jetpack Compose Search Screen backed by paged Room FTS4 queries
@@ -226,9 +226,9 @@ fun SearchScreen(
             placeholder = {
                 Text(
                     text = if (state.useHybrid && embedderReady) {
-                        "Query OCR text, PDFs, or meaning (Hybrid FTS4)..."
+                        "Search English, Hinglish, or हिंदी (e.g. भूरी, बिल)..."
                     } else {
-                        "Query Room FTS4 index (prefix & full-text)..."
+                        "Search English or हिंदी / Hinglish (e.g. भूरी, रसीद)..."
                     },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis

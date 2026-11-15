@@ -31,10 +31,12 @@ import com.example.data.db.FtsQuerySanitizer
 import com.example.data.db.ModelRecordEntity
 import com.example.data.preferences.EngineSettings
 import com.example.data.preferences.HardwareDelegate
+import com.example.data.preferences.LlmProviderMode
 import com.example.data.preferences.ScanMode
 import com.example.operations.OperationProgress
 import com.example.operations.OperationStatus
 import com.example.operations.OperationType
+import com.example.search.HindiTransliterator
 import com.example.workers.ModelDownloadWorker
 import com.example.workers.StorageIndexerWorker
 import kotlinx.coroutines.CancellationException
@@ -127,6 +129,15 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
     private val _searchAgentMode = MutableStateFlow(SearchAgentMode.SEARCH)
     val searchAgentMode: StateFlow<SearchAgentMode> = _searchAgentMode.asStateFlow()
 
+    private val _ollamaModels = MutableStateFlow<List<String>>(emptyList())
+    val ollamaModels: StateFlow<List<String>> = _ollamaModels.asStateFlow()
+
+    private val _ollamaTestStatus = MutableStateFlow("")
+    val ollamaTestStatus: StateFlow<String> = _ollamaTestStatus.asStateFlow()
+
+    private val _isTestingOllama = MutableStateFlow(false)
+    val isTestingOllama: StateFlow<Boolean> = _isTestingOllama.asStateFlow()
+
     private var vectorizeJob: Job? = null
     private var mediaPickJob: Job? = null
     private var searchJob: Job? = null
@@ -167,14 +178,14 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
         _searchQuery,
         _selectedCategory,
         embeddingTelemetry,
-        embeddedCount
-    ) { query, cat, embedState, _ ->
-        Triple(query.trim(), cat, embedState.status == EmbeddingRuntimeStatus.READY)
-    }.flatMapLatest { (query, cat, embedderReady) ->
-        val safeFts = FtsQuerySanitizer.toSafeFtsQuery(query)
+        embeddedCount,
+        indexedCount
+    ) { query, cat, _, _, _ ->
+        query.trim() to cat
+    }.flatMapLatest { (query, cat) ->
         val catFilter = cat.takeIf { it != "ALL" }
         when {
-            query.isNotBlank() && embedderReady -> flow {
+            query.isNotBlank() -> flow {
                 val hits = withContext(Dispatchers.IO) {
                     container.hybridSearchEngine.search(
                         rawQuery = query,
@@ -183,13 +194,6 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
                 emit(hits.map { it.file })
-            }
-            safeFts.isNotEmpty() -> fileDao.observeSearchFts(safeFts, limit = 120)
-            query.isNotBlank() -> flow {
-                val hits = withContext(Dispatchers.IO) {
-                    fileDao.searchFallbackLike(query, category = catFilter, limit = 120)
-                }
-                emit(hits)
             }
             cat != "ALL" -> fileDao.observeByCategory(cat, limit = 300)
             else -> fileDao.observeAllActiveFiles(limit = 400)
@@ -374,20 +378,50 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
                         )
                     }
                 } else {
-                    val ftsExpr = FtsQuerySanitizer.toSafeFtsQuery(query)
+                    val ftsExpr = FtsQuerySanitizer.toCrossScriptFtsQuery(query)
                     val (pageItems, totalCount) = withContext(Dispatchers.IO) {
                         when {
-                            ftsExpr.isNotEmpty() -> {
-                                val ftsCount = fileDao.countFtsMatches(ftsExpr, catFilter, minMs)
-                                if (ftsCount > 0) {
-                                    val rows = fileDao.searchFtsPaged(
-                                        ftsQuery = ftsExpr,
+                            query.isNotBlank() && ftsExpr.isNotEmpty() -> {
+                                val ftsCount = runCatching {
+                                    fileDao.countFtsMatches(ftsExpr, catFilter, minMs)
+                                }.getOrDefault(0)
+                                val ftsRows = if (ftsCount > 0) {
+                                    runCatching {
+                                        fileDao.searchFtsPaged(
+                                            ftsQuery = ftsExpr,
+                                            category = catFilter,
+                                            minModifiedMs = minMs,
+                                            limit = SEARCH_PAGE_SIZE,
+                                            offset = offset
+                                        )
+                                    }.getOrDefault(emptyList())
+                                } else {
+                                    emptyList()
+                                }
+
+                                // Also run fast cross-script phonetic matching on first page
+                                // so Hindi/Devanagari <-> English/underscore names always match.
+                                if (reset && (ftsRows.size < 15 || HindiTransliterator.containsDevanagari(query))) {
+                                    val phoneticMatches = fileDao.getSearchItemsForPhoneticMatch(
                                         category = catFilter,
                                         minModifiedMs = minMs,
-                                        limit = SEARCH_PAGE_SIZE,
-                                        offset = offset
-                                    )
-                                    rows to ftsCount
+                                        limit = 600
+                                    ).mapNotNull { item ->
+                                        val score = HindiTransliterator.scoreCrossScriptMatch(
+                                            rawQuery = query,
+                                            fileName = item.fileName,
+                                            extractedText = item.snippetPreview,
+                                            filePath = item.filePath
+                                        )
+                                        if (score > 0f) item to score else null
+                                    }.sortedByDescending { it.second }.map { it.first }
+
+                                    val merged = (ftsRows + phoneticMatches)
+                                        .distinctBy { it.id }
+                                        .take(SEARCH_PAGE_SIZE)
+                                    merged to maxOf(ftsCount, merged.size)
+                                } else if (ftsCount > 0) {
+                                    ftsRows to ftsCount
                                 } else {
                                     val likeCount = fileDao.countFallbackLikeMatches(query, catFilter, minMs)
                                     val rows = fileDao.searchFallbackLikePaged(
@@ -913,6 +947,41 @@ class EdgeClawViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
             }
+        }
+    }
+
+    fun selectLlmProviderMode(mode: LlmProviderMode) {
+        viewModelScope.launch {
+            container.preferences.setLlmProviderMode(mode)
+            _uiBannerMessage.value = "LLM backend set to ${mode.label}"
+        }
+    }
+
+    fun saveOllamaConfig(baseUrl: String, modelName: String, apiKey: String) {
+        viewModelScope.launch {
+            container.preferences.setOllamaConfig(baseUrl, modelName, apiKey)
+            _ollamaTestStatus.value = "Saved Ollama config (${modelName.trim().ifBlank { "gemma3:4b" }})"
+            _uiBannerMessage.value = "Ollama API settings saved"
+        }
+    }
+
+    fun testAndFetchOllamaModels(baseUrl: String, apiKey: String) {
+        if (_isTestingOllama.value) return
+        viewModelScope.launch {
+            _isTestingOllama.value = true
+            _ollamaTestStatus.value = "Connecting to ${baseUrl.trim()}..."
+            val res = container.llmEngineManager.testOllamaConnection(baseUrl, apiKey)
+            res.onSuccess { list ->
+                _ollamaModels.value = list
+                _ollamaTestStatus.value = if (list.isEmpty()) {
+                    "Connected! No models pulled yet on server."
+                } else {
+                    "Connected • Found ${list.size} model(s): ${list.take(3).joinToString(", ")}"
+                }
+            }.onFailure { err ->
+                _ollamaTestStatus.value = "Connection failed: ${err.message ?: "Unreachable"}"
+            }
+            _isTestingOllama.value = false
         }
     }
 

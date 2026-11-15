@@ -6,6 +6,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import com.example.search.HindiTransliterator
 import kotlinx.coroutines.flow.Flow
 
 @Immutable
@@ -143,6 +144,26 @@ interface FileIndexDao {
 
     @Query(
         """
+        SELECT id, file_path, file_name, parent_dir, mime_type, file_category,
+               size_bytes, last_modified_ms,
+               SUBSTR(extracted_text, 1, 220) AS snippet_preview,
+               (embedding_vector IS NOT NULL) AS has_embedding
+        FROM file_index
+        WHERE is_trashed = 0
+          AND (:category IS NULL OR file_category = :category)
+          AND (:minModifiedMs IS NULL OR last_modified_ms >= :minModifiedMs)
+        ORDER BY last_modified_ms DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getSearchItemsForPhoneticMatch(
+        category: String? = null,
+        minModifiedMs: Long? = null,
+        limit: Int = 600
+    ): List<FileSearchListItem>
+
+    @Query(
+        """
         SELECT * FROM file_index
         WHERE is_trashed = 0
           AND embedding_vector IS NOT NULL
@@ -213,6 +234,24 @@ interface FileIndexDao {
         minModifiedMs: Long? = null,
         maxModifiedMs: Long? = null,
         limit: Int = 40
+    ): List<FileIndexEntity>
+
+    @Query(
+        """
+        SELECT * FROM file_index
+        WHERE is_trashed = 0
+          AND (:category IS NULL OR file_category = :category)
+          AND (:minModifiedMs IS NULL OR last_modified_ms >= :minModifiedMs)
+          AND (:maxModifiedMs IS NULL OR last_modified_ms <= :maxModifiedMs)
+        ORDER BY last_modified_ms DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getActiveCandidatesForPhoneticSearch(
+        category: String? = null,
+        minModifiedMs: Long? = null,
+        maxModifiedMs: Long? = null,
+        limit: Int = 600
     ): List<FileIndexEntity>
 
     @Query(
@@ -320,12 +359,12 @@ interface ModelRecordDao {
 object FtsQuerySanitizer {
     /**
      * Converts free-form natural language queries into safe SQLite FTS4 MATCH expressions
-     * using prefix matching (e.g. "electricity bill" -> "electricity* bill*").
+     * using prefix matching (e.g. "electricity bill" -> "electricity* bill*"), preserving Unicode scripts.
      */
     fun toSafeFtsQuery(raw: String): String {
         val tokens = raw
             .lowercase()
-            .replace(Regex("[^a-z0-9_\\s]"), " ")
+            .replace(Regex("[^\\p{L}\\p{N}_\\s]"), " ")
             .trim()
             .split(Regex("\\s+"))
             .filter { it.isNotBlank() && it !in setOf("and", "or", "not", "near") }
@@ -333,5 +372,19 @@ object FtsQuerySanitizer {
             .take(8)
         if (tokens.isEmpty()) return ""
         return tokens.joinToString(" ") { "$it*" }
+    }
+
+    /**
+     * Builds an expanded FTS4 OR query covering Hindi (Devanagari), Hinglish transliteration,
+     * phonetic vowel variations (e.g. भूरी / भुरी / bhuri / bhoori), and English concepts.
+     */
+    fun toCrossScriptFtsQuery(raw: String): String {
+        val expanded = HindiTransliterator.expandQueryTokens(raw)
+            .map { it.replace(Regex("[^\\p{L}\\p{N}_]"), "") }
+            .filter { it.length >= 2 || it.all { ch -> ch.isDigit() } }
+            .distinct()
+            .take(18)
+        if (expanded.isEmpty()) return toSafeFtsQuery(raw)
+        return expanded.joinToString(" OR ") { "$it*" }
     }
 }

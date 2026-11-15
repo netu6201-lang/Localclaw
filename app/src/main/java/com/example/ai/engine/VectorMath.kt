@@ -3,6 +3,7 @@ package com.example.ai.engine
 import com.example.data.db.FileIndexDao
 import com.example.data.db.FileIndexEntity
 import com.example.data.db.FtsQuerySanitizer
+import com.example.search.HindiTransliterator
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.sqrt
@@ -51,7 +52,8 @@ data class HybridSearchHit(
 )
 
 /**
- * Combines SQLite FTS4 keyword/prefix matching with EmbeddingGemma vector cosine similarity.
+ * Combines SQLite FTS4 keyword/prefix matching, Hindi <-> English cross-script phonetic matching,
+ * and EmbeddingGemma vector cosine similarity.
  */
 class HybridSearchEngine(
     private val fileIndexDao: FileIndexDao,
@@ -67,15 +69,18 @@ class HybridSearchEngine(
         val query = rawQuery.trim()
         if (query.isEmpty()) return emptyList()
 
-        val ftsExpr = FtsQuerySanitizer.toSafeFtsQuery(query)
-        val ftsHits = if (ftsExpr.isNotEmpty()) {
-            fileIndexDao.searchFts(
-                ftsQuery = ftsExpr,
-                category = category,
-                minModifiedMs = minModifiedMs,
-                maxModifiedMs = maxModifiedMs,
-                limit = limit
-            )
+        // 1. Cross-script FTS4 expansion (Hindi/Devanagari + transliterated Roman + English concepts)
+        val expandedFtsExpr = FtsQuerySanitizer.toCrossScriptFtsQuery(query)
+        val ftsHits = if (expandedFtsExpr.isNotEmpty()) {
+            runCatching {
+                fileIndexDao.searchFts(
+                    ftsQuery = expandedFtsExpr,
+                    category = category,
+                    minModifiedMs = minModifiedMs,
+                    maxModifiedMs = maxModifiedMs,
+                    limit = limit * 2
+                )
+            }.getOrDefault(emptyList())
         } else {
             emptyList()
         }
@@ -92,24 +97,71 @@ class HybridSearchEngine(
             emptyList()
         }
 
-        val keywordResults = if (ftsHits.isNotEmpty()) ftsHits else fallbackHits
-        val keywordRankMap = HashMap<Long, Int>(keywordResults.size)
-        keywordResults.forEachIndexed { idx, file -> keywordRankMap[file.id] = idx }
+        // 2. Phonetic cross-script scan (catches Devanagari filenames/OCR like "भूरी" from "bhuri"
+        //    and Roman filenames like "bhuri_bill.jpg" from "भुरी" or "भूरी", including underscores)
+        val phoneticHits = fileIndexDao.getActiveCandidatesForPhoneticSearch(
+            category = category,
+            minModifiedMs = minModifiedMs,
+            maxModifiedMs = maxModifiedMs,
+            limit = 600
+        ).mapNotNull { candidate ->
+            val phoneticScore = HindiTransliterator.scoreCrossScriptMatch(
+                rawQuery = query,
+                fileName = candidate.fileName,
+                extractedText = candidate.extractedText,
+                filePath = candidate.filePath
+            )
+            if (phoneticScore > 0f) candidate to phoneticScore else null
+        }.sortedByDescending { it.second }.take(limit)
 
         val mergedMap = LinkedHashMap<Long, HybridSearchHit>()
+
+        val keywordResults = (ftsHits + fallbackHits).distinctBy { it.id }
         keywordResults.forEachIndexed { idx, file ->
             val rrf = 1f / (12f + idx)
+            val bonus = HindiTransliterator.scoreCrossScriptMatch(
+                rawQuery = query,
+                fileName = file.fileName,
+                extractedText = file.extractedText,
+                filePath = file.filePath
+            ) * 0.02f
             mergedMap[file.id] = HybridSearchHit(
                 file = file,
-                score = rrf,
+                score = rrf + bonus,
                 ftsMatched = true,
                 semanticSimilarity = 0f
             )
         }
 
-        // If EmbeddingGemma is loaded, fuse cosine similarity scores across embedded files
+        for ((file, phoneticScore) in phoneticHits) {
+            val existing = mergedMap[file.id]
+            val boost = (phoneticScore * 0.03f).coerceAtMost(0.15f)
+            if (existing != null) {
+                mergedMap[file.id] = existing.copy(score = existing.score + boost)
+            } else {
+                mergedMap[file.id] = HybridSearchHit(
+                    file = file,
+                    score = 0.04f + boost,
+                    ftsMatched = true,
+                    semanticSimilarity = 0f
+                )
+            }
+        }
+
+        // 3. If EmbeddingGemma is loaded, fuse cosine similarity scores across embedded files
         if (embeddingEngineManager.telemetry.value.status == EmbeddingRuntimeStatus.READY) {
-            val queryVector = embeddingEngineManager.embedQuery(query)
+            val semanticQuery = buildString {
+                append(query)
+                val extras = HindiTransliterator.expandQueryTokens(query)
+                    .filter { !HindiTransliterator.containsDevanagari(it) }
+                    .take(6)
+                if (extras.isNotEmpty() && HindiTransliterator.containsDevanagari(query)) {
+                    append(" (")
+                    append(extras.joinToString(" "))
+                    append(")")
+                }
+            }
+            val queryVector = embeddingEngineManager.embedQuery(semanticQuery)
             if (queryVector != null && queryVector.isNotEmpty()) {
                 val embeddedCandidates = fileIndexDao.getFilesWithEmbeddings(
                     category = category,
